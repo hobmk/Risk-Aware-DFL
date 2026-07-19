@@ -143,7 +143,7 @@ def main() -> None:
     )
 
     device = torch.device(
-        "mps" if torch.backends.mps.is_available() else "cpu"
+        "cuda" if torch.cuda.is_available() else "cpu"
     )
 
     print("Device:", device)
@@ -162,7 +162,7 @@ def main() -> None:
     )
 
     # Dataset이 float32이므로 모델도 float32로 통일
-    model = model.double().to(device)
+    model = model.float().to(device)
 
     criterion = nn.MSELoss()
 
