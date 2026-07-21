@@ -12,10 +12,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-
-from implementations.dfl_mvo_lee2025.src.dataset import RollingMVODataset
+from implementations.dfl_mvo_lee2025.src.dataset import (
+    RollingMVODataset,
+)
 from implementations.dfl_mvo_lee2025.scripts.train_mlp_markowitz_regret import (
     MLPWithMarkowitz,
+)
+from implementations.dfl_mvo_lee2025.src.losses import (
     markowitz_cost,
 )
 
@@ -44,11 +47,12 @@ def main() -> None:
     covariance = batch["covariance"]
 
     model = MLPWithMarkowitz(
-        n_assets=dataset.n_assets,
-        lookback=60,
-        hidden_dim=256,
-        risk_aversion=1.0,
-    )
+    n_assets=dataset.n_assets,
+    lookback=60,
+    hidden_dim=256,
+    risk_aversion=1.0,
+    max_weight=0.2,
+)
 
     model.eval()
 

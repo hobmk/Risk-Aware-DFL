@@ -209,15 +209,15 @@ class RollingMVODataset(Dataset):
         target_date = self.return_dates[target_position]
 
         return {
-            "features": torch.as_tensor(
+            "features": torch.tensor(
                 feature_window,
                 dtype=self.dtype,
             ),
-            "target": torch.as_tensor(
+            "target": torch.tensor(
                 target_return,
                 dtype=self.dtype,
             ),
-            "covariance": torch.as_tensor(
+            "covariance": torch.tensor(
                 covariance,
                 dtype=self.dtype,
             ),
