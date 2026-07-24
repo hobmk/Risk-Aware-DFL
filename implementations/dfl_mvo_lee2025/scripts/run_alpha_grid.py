@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-5,
+        default=1e-4,
     )
     parser.add_argument(
         "--weight-decay",
