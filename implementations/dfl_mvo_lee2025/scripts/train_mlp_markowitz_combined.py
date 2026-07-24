@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
+import shlex
+import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -99,9 +103,9 @@ def parse_args() -> argparse.Namespace:
         default=42,
     )
     parser.add_argument(
-    "--dropout",
-    type=float,
-    default=0.1,
+        "--dropout",
+        type=float,
+        default=0.1,
     )
 
     parser.add_argument(
@@ -127,8 +131,44 @@ def parse_args() -> argparse.Namespace:
         "--validation-end",
         default="2022-12-31",
     )
+    parser.add_argument(
+        "--experiment-name",
+        default="paper_baseline",
+    )
+    parser.add_argument(
+        "--diagnostics-every",
+        type=int,
+        default=1,
+        help="0이면 gradient 진단 출력을 비활성화합니다.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="기존 실험 폴더를 삭제하고 다시 실행합니다.",
+    )
 
     return parser.parse_args()
+
+
+def sanitize_experiment_name(name: str) -> str:
+    cleaned = "".join(
+        character
+        if character.isalnum() or character in "-_."
+        else "_"
+        for character in name.strip()
+    )
+    return cleaned or "experiment"
+
+
+def save_json(path: Path, payload: dict) -> None:
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(
+            payload,
+            file,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=True,
+        )
 
 
 class MLPWithMarkowitz(nn.Module):
@@ -260,21 +300,35 @@ def compute_losses(
     )
 
 
-def calculate_gradient_norm(
+def calculate_loss_gradient_norm(
+    loss: torch.Tensor,
     module: nn.Module,
 ) -> tuple[float, bool]:
+    parameters = [
+        parameter
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    ]
+
+    if not loss.requires_grad:
+        return 0.0, False
+
+    gradients = torch.autograd.grad(
+        loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+
     grad_norm_squared = 0.0
     has_gradient = False
 
-    for parameter in module.parameters():
-        if parameter.grad is None:
+    for gradient in gradients:
+        if gradient is None:
             continue
 
         has_gradient = True
-        parameter_grad_norm = (
-            parameter.grad.detach().norm(2).item()
-        )
-        grad_norm_squared += parameter_grad_norm**2
+        grad_norm_squared += gradient.detach().norm(2).item() ** 2
 
     return grad_norm_squared**0.5, has_gradient
 
@@ -289,8 +343,9 @@ def print_training_diagnostics(
     risk_factor: torch.Tensor,
     alpha: float,
     mse_scale: float,
-    grad_norm: float,
-    has_gradient: bool,
+    mvo_grad_norm: float,
+    mse_grad_norm: float,
+    combined_grad_norm: float,
     active_threshold: float,
     cap_tolerance: float,
 ) -> None:
@@ -339,15 +394,9 @@ def print_training_diagnostics(
         print("-" * 80)
         print("첫 번째 학습 Batch 진단")
         print("-" * 80)
-        print(
-            f"Combined Loss: {total_loss.item():.8f}"
-        )
-        print(
-            f"Raw Regret: {regret.item():.8f}"
-        )
-        print(
-            f"Raw MSE: {mse.item():.8f}"
-        )
+        print(f"Combined Loss: {total_loss.item():.8f}")
+        print(f"Raw Regret: {regret.item():.8f}")
+        print(f"Raw MSE: {mse.item():.8f}")
         print(
             f"Weighted MVO Contribution: "
             f"{mvo_contribution:.8f}"
@@ -357,10 +406,16 @@ def print_training_diagnostics(
             f"{mse_contribution:.8f}"
         )
         print(
-            f"Gradient Norm: {grad_norm:.12f}"
+            f"Weighted MVO Gradient Norm: "
+            f"{mvo_grad_norm:.12f}"
         )
         print(
-            f"Has Gradient: {has_gradient}"
+            f"Weighted MSE Gradient Norm: "
+            f"{mse_grad_norm:.12f}"
+        )
+        print(
+            f"Combined Gradient Norm: "
+            f"{combined_grad_norm:.12f}"
         )
         print(
             f"Average Active Assets: "
@@ -437,12 +492,35 @@ def run_epoch(
             )
 
             if is_training:
-                total_loss.backward()
-
                 if show_diagnostics and batch_index == 0:
-                    grad_norm, has_gradient = (
-                        calculate_gradient_norm(
-                            model.return_model
+                    mse_solver = mse.to(
+                        device=regret.device,
+                        dtype=regret.dtype,
+                    )
+
+                    weighted_mvo_loss = alpha * regret
+                    weighted_mse_loss = (
+                        (1.0 - alpha)
+                        * mse_scale
+                        * mse_solver
+                    )
+
+                    mvo_grad_norm, _ = (
+                        calculate_loss_gradient_norm(
+                            weighted_mvo_loss,
+                            model.return_model,
+                        )
+                    )
+                    mse_grad_norm, _ = (
+                        calculate_loss_gradient_norm(
+                            weighted_mse_loss,
+                            model.return_model,
+                        )
+                    )
+                    combined_grad_norm, _ = (
+                        calculate_loss_gradient_norm(
+                            total_loss,
+                            model.return_model,
                         )
                     )
 
@@ -456,12 +534,14 @@ def run_epoch(
                         risk_factor=risk_factor,
                         alpha=alpha,
                         mse_scale=mse_scale,
-                        grad_norm=grad_norm,
-                        has_gradient=has_gradient,
+                        mvo_grad_norm=mvo_grad_norm,
+                        mse_grad_norm=mse_grad_norm,
+                        combined_grad_norm=combined_grad_norm,
                         active_threshold=active_threshold,
                         cap_tolerance=cap_tolerance,
                     )
 
+                total_loss.backward()
                 optimizer.step()
 
         batch_size = features.size(0)
@@ -746,6 +826,10 @@ def evaluate_and_save_test_results(
     )
 
     summary = {
+        "experiment_name": checkpoint.get(
+            "experiment_name",
+            "unknown",
+        ),
         "dataset": dataset_name,
         "alpha": alpha,
         "lambda": risk_aversion,
@@ -779,16 +863,10 @@ def evaluate_and_save_test_results(
         **portfolio_metrics,
     }
 
-    with (
-        output_dir / "summary.json"
-    ).open("w", encoding="utf-8") as file:
-        json.dump(
-            summary,
-            file,
-            indent=2,
-            ensure_ascii=False,
-            allow_nan=True,
-        )
+    save_json(
+        output_dir / "summary.json",
+        summary,
+    )
 
     return summary
 
@@ -882,6 +960,10 @@ def main() -> None:
         "",
     )
 
+    experiment_name = sanitize_experiment_name(
+        args.experiment_name
+    )
+
     output_dir = (
         PROJECT_ROOT
         / "implementations"
@@ -889,24 +971,65 @@ def main() -> None:
         / "outputs"
         / "combined"
         / dataset_name
+        / experiment_name
         / f"alpha_{args.alpha:.2f}"
         / f"lambda_{args.risk_aversion:.2f}"
         / f"maxw_{args.max_weight:.2f}"
         / f"seed_{args.seed}"
     )
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if output_dir.exists() and any(output_dir.iterdir()):
+        if not args.overwrite:
+            raise FileExistsError(
+                f"기존 실험 결과가 있습니다: {output_dir}\n"
+                "다시 실행하려면 --overwrite를 추가하세요."
+            )
+        shutil.rmtree(output_dir)
 
-    best_model_path = (
-        output_dir / "best_model.pt"
-    )
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    history_path = (
-        output_dir / "history.csv"
-    )
+    config = {
+        "experiment_name": experiment_name,
+        "created_at_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "command": " ".join(
+            shlex.quote(argument)
+            for argument in sys.argv
+        ),
+        "arguments": vars(args),
+        "dataset": {
+            "name": dataset_name,
+            "price_csv": str(price_path.resolve()),
+            "return_type": "simple",
+            "covariance_jitter": 1e-6,
+            "n_assets": dataset.n_assets,
+            "tickers": dataset.tickers,
+            "train_samples": len(train_set),
+            "validation_samples": len(validation_set),
+            "test_samples": len(test_set),
+        },
+        "environment": {
+            "python": platform.python_version(),
+            "torch": str(torch.__version__),
+            "pandas": pd.__version__,
+            "device": str(device),
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_version": torch.version.cuda,
+            "gpu": (
+                torch.cuda.get_device_name(0)
+                if torch.cuda.is_available()
+                else None
+            ),
+        },
+        "output_dir": str(output_dir.resolve()),
+    }
+
+    config_path = output_dir / "config.json"
+    save_json(config_path, config)
+
+    best_model_path = output_dir / "best_model.pt"
+    history_path = output_dir / "history.csv"
 
     best_validation_combined = float("inf")
     best_epoch = 0
@@ -945,7 +1068,13 @@ def main() -> None:
             optimizer=optimizer,
             active_threshold=args.active_threshold,
             cap_tolerance=args.cap_tolerance,
-            show_diagnostics=True,
+            show_diagnostics=(
+                args.diagnostics_every > 0
+                and (
+                    epoch == 1
+                    or epoch % args.diagnostics_every == 0
+                )
+            ),
         )
 
         (
@@ -1038,7 +1167,9 @@ def main() -> None:
                     "hidden_dim":
                         args.hidden_dim,
                     "tickers":
-                        dataset.tickers,
+                        list(dataset.tickers),
+                    "experiment_name":
+                        experiment_name,
                 },
                 best_model_path,
             )
@@ -1054,6 +1185,7 @@ def main() -> None:
     checkpoint = torch.load(
         best_model_path,
         map_location=device,
+        weights_only=True,
     )
 
     model.return_model.load_state_dict(
@@ -1115,6 +1247,9 @@ def main() -> None:
     print(
         f"Average Active Assets: "
         f"{summary['average_active_assets']:.4f}"
+    )
+    print(
+        f"Config: {config_path}"
     )
     print(
         f"Saved directory: {output_dir}"
