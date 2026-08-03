@@ -69,6 +69,14 @@ implementations/dfl_mvo_lee2025/data/processed/
 implementations/dfl_mvo_lee2025/data/cache/
 
 # ============================================================
+# Generated reports
+# ============================================================
+implementations/dfl_mvo_lee2025/scripts/make_paper_report.py
+compare_input_standardization_results.csv
+tune_arch_results.csv
+tune_mse_scale_results.csv
+
+# ============================================================
 # Temporary files
 # ============================================================
 *.tmp
