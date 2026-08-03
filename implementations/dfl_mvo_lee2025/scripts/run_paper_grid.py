@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mse-scale", type=float, default=15.0)
     parser.add_argument("--active-threshold", type=float, default=1e-3)
     parser.add_argument("--cap-tolerance", type=float, default=1e-4)
+    parser.add_argument("--standardize-inputs",action="store_true",)
     parser.add_argument("--train-end", default="2021-12-31")
     parser.add_argument("--validation-end", default="2022-12-31")
     parser.add_argument("--diagnostics-every", type=int, default=0)
@@ -187,7 +188,9 @@ def main() -> None:
             "--diagnostics-every",
             str(args.diagnostics_every),
         ]
-
+        if args.standardize_inputs:
+            command.append("--standardize-inputs")
+            
         if args.overwrite:
             command.append("--overwrite")
 

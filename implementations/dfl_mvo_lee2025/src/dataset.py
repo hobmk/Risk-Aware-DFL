@@ -284,3 +284,71 @@ def chronological_split(
         Subset(dataset, validation_indices),
         Subset(dataset, test_indices),
     )
+class FeatureStandardizedSubset(Dataset):
+    """Subset의 features만 표준화하고 target과 covariance는 유지한다."""
+
+    def __init__(
+        self,
+        subset: Subset,
+        feature_mean: torch.Tensor,
+        feature_std: torch.Tensor,
+    ) -> None:
+        self.subset = subset
+        self.feature_mean = feature_mean
+        self.feature_std = feature_std
+
+    def __len__(self) -> int:
+        return len(self.subset)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        sample = dict(self.subset[index])
+        sample["features"] = (
+            sample["features"] - self.feature_mean
+        ) / self.feature_std
+        return sample
+
+
+def fit_feature_standardizer(
+    dataset: RollingMVODataset,
+    train_subset: Subset,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Train 입력에 실제 사용되는 수익률만으로 종목별 평균·표준편차를 계산한다."""
+
+    feature_positions: list[int] = []
+
+    for sample_index in train_subset.indices:
+        target_position = int(
+            dataset.target_positions[int(sample_index)]
+        )
+        feature_positions.extend(
+            range(
+                target_position - dataset.lookback,
+                target_position,
+            )
+        )
+
+    unique_positions = np.unique(
+        np.asarray(feature_positions, dtype=np.int64)
+    )
+    train_features = dataset.returns[unique_positions]
+
+    feature_mean = train_features.mean(axis=0)
+    feature_std = train_features.std(axis=0, ddof=0)
+
+    if not np.isfinite(feature_mean).all():
+        raise ValueError("입력 표준화 평균에 비정상 값이 있습니다.")
+
+    if not np.isfinite(feature_std).all():
+        raise ValueError("입력 표준화 표준편차에 비정상 값이 있습니다.")
+
+    feature_std = np.where(
+        feature_std < eps,
+        1.0,
+        feature_std,
+    )
+
+    return (
+        torch.tensor(feature_mean, dtype=dataset.dtype),
+        torch.tensor(feature_std, dtype=dataset.dtype),
+    )

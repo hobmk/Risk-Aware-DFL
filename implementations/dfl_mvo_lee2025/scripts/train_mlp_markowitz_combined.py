@@ -22,8 +22,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 from implementations.dfl_mvo_lee2025.src.dataset import (
+    FeatureStandardizedSubset,
     RollingMVODataset,
     chronological_split,
+    fit_feature_standardizer,
 )
 from implementations.dfl_mvo_lee2025.src.losses import (
     combined_loss,
@@ -122,6 +124,11 @@ def parse_args() -> argparse.Namespace:
         "--cap-tolerance",
         type=float,
         default=1e-4,
+    )
+    parser.add_argument(
+    "--standardize-inputs",
+    action="store_true",
+    help="Train 통계로 MLP 입력 features만 종목별 표준화합니다.",
     )
     parser.add_argument(
         "--train-end",
@@ -568,6 +575,108 @@ def run_epoch(
         total_mse / total_samples,
     )
 
+def evaluate_validation_portfolio_metrics(
+    model: MLPWithMarkowitz,
+    loader: DataLoader,
+    device: torch.device,
+    risk_aversion: float,
+    active_threshold: float,
+    output_dir: Path,
+) -> dict[str, float]:
+    model.eval()
+
+    daily_rows: list[dict] = []
+    portfolio_returns: list[float] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            features = batch["features"].to(device)
+            targets = batch["target"].to(device)
+            covariance = batch["covariance"].to(
+                device="cpu",
+                dtype=torch.float64,
+            )
+            dates = list(batch["target_date"])
+
+            _, predicted_weights, _ = model(
+                features=features,
+                covariance=covariance,
+            )
+
+            predicted_weights = predicted_weights.detach().to(
+                device="cpu",
+                dtype=torch.float64,
+            )
+            true_returns = targets.detach().to(
+                device="cpu",
+                dtype=torch.float64,
+            )
+
+            daily_portfolio_return = torch.sum(
+                predicted_weights * true_returns,
+                dim=-1,
+            )
+            portfolio_variance = torch.einsum(
+                "bi,bij,bj->b",
+                predicted_weights,
+                covariance,
+                predicted_weights,
+            )
+            active_asset_count = (
+                predicted_weights > active_threshold
+            ).sum(dim=-1)
+
+            portfolio_returns.extend(
+                daily_portfolio_return.tolist()
+            )
+
+            for sample_index, date in enumerate(dates):
+                daily_rows.append(
+                    {
+                        "date": date,
+                        "portfolio_return": daily_portfolio_return[
+                            sample_index
+                        ].item(),
+                        "portfolio_variance": portfolio_variance[
+                            sample_index
+                        ].item(),
+                        "risk_penalty": (
+                            risk_aversion
+                            * portfolio_variance[sample_index]
+                        ).item(),
+                        "active_asset_count": int(
+                            active_asset_count[sample_index].item()
+                        ),
+                    }
+                )
+
+    if not portfolio_returns:
+        raise RuntimeError(
+            "Validation DataLoader에 샘플이 없습니다."
+        )
+
+    returns_tensor = torch.tensor(
+        portfolio_returns,
+        dtype=torch.float64,
+    )
+    portfolio_metrics, wealth, drawdown = (
+        calculate_portfolio_metrics(returns_tensor)
+    )
+
+    daily_dataframe = pd.DataFrame(daily_rows)
+    daily_dataframe["wealth"] = wealth.numpy()
+    daily_dataframe["drawdown"] = drawdown.numpy()
+    daily_dataframe.to_csv(
+        output_dir / "validation_daily_portfolio.csv",
+        index=False,
+    )
+
+    return {
+        **portfolio_metrics,
+        "average_active_assets": float(
+            daily_dataframe["active_asset_count"].mean()
+        ),
+    }
 
 def evaluate_and_save_test_results(
     model: MLPWithMarkowitz,
@@ -583,6 +692,7 @@ def evaluate_and_save_test_results(
     seed: int,
     active_threshold: float,
     checkpoint: dict,
+    validation_portfolio_metrics: dict[str, float],
 ) -> dict[str, float | int | str]:
     model.eval()
 
@@ -849,6 +959,41 @@ def evaluate_and_save_test_results(
         "validation_mse": float(
             checkpoint["validation_mse"]
         ),
+                "validation_annualized_return_cagr": float(
+            validation_portfolio_metrics[
+                "annualized_return_cagr"
+            ]
+        ),
+        "validation_annualized_return_mean": float(
+            validation_portfolio_metrics[
+                "annualized_return_mean"
+            ]
+        ),
+        "validation_annualized_volatility": float(
+            validation_portfolio_metrics[
+                "annualized_volatility"
+            ]
+        ),
+        "validation_sharpe_ratio": float(
+            validation_portfolio_metrics[
+                "sharpe_ratio"
+            ]
+        ),
+        "validation_maximum_drawdown": float(
+            validation_portfolio_metrics[
+                "maximum_drawdown"
+            ]
+        ),
+        "validation_final_wealth": float(
+            validation_portfolio_metrics[
+                "final_wealth"
+            ]
+        ),
+        "validation_average_active_assets": float(
+            validation_portfolio_metrics[
+                "average_active_assets"
+            ]
+        ),
         "test_combined":
             total_combined / total_samples,
         "test_regret":
@@ -907,6 +1052,30 @@ def main() -> None:
         train_end=args.train_end,
         validation_end=args.validation_end,
     )
+    feature_mean = None
+    feature_std = None
+
+    if args.standardize_inputs:
+        feature_mean, feature_std = fit_feature_standardizer(
+            dataset=dataset,
+            train_subset=train_set,
+        )
+
+        train_set = FeatureStandardizedSubset(
+            subset=train_set,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+        )
+        validation_set = FeatureStandardizedSubset(
+            subset=validation_set,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+        )
+        test_set = FeatureStandardizedSubset(
+            subset=test_set,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+        )
 
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
@@ -1008,6 +1177,17 @@ def main() -> None:
             "train_samples": len(train_set),
             "validation_samples": len(validation_set),
             "test_samples": len(test_set),
+            "standardize_inputs": args.standardize_inputs,
+            "feature_mean": (
+                feature_mean.tolist()
+                if feature_mean is not None
+                else None
+            ),
+            "feature_std": (
+                feature_std.tolist()
+                if feature_std is not None
+                else None
+            ),
         },
         "environment": {
             "python": platform.python_version(),
@@ -1049,6 +1229,7 @@ def main() -> None:
     print("Train samples:", len(train_set))
     print("Validation samples:", len(validation_set))
     print("Test samples:", len(test_set))
+    print("Standardize inputs:", args.standardize_inputs)
     print("=" * 80)
 
     for epoch in range(
@@ -1192,6 +1373,17 @@ def main() -> None:
         checkpoint["model_state_dict"]
     )
 
+    validation_portfolio_metrics = (
+        evaluate_validation_portfolio_metrics(
+            model=model,
+            loader=validation_loader,
+            device=device,
+            risk_aversion=args.risk_aversion,
+            active_threshold=args.active_threshold,
+            output_dir=output_dir,
+        )
+    )
+
     summary = evaluate_and_save_test_results(
         model=model,
         loader=test_loader,
@@ -1206,6 +1398,9 @@ def main() -> None:
         seed=args.seed,
         active_threshold=args.active_threshold,
         checkpoint=checkpoint,
+        validation_portfolio_metrics=(
+            validation_portfolio_metrics
+        ),
     )
 
     print("=" * 80)
@@ -1215,6 +1410,22 @@ def main() -> None:
     print(
         f"Best Validation Combined: "
         f"{best_validation_combined:.8f}"
+    )
+    print(
+        f"Validation Annualized Return: "
+        f"{summary['validation_annualized_return_cagr']:.6f}"
+    )
+    print(
+        f"Validation Sharpe Ratio: "
+        f"{summary['validation_sharpe_ratio']:.6f}"
+    )
+    print(
+        f"Validation Maximum Drawdown: "
+        f"{summary['validation_maximum_drawdown']:.6f}"
+    )
+    print(
+        f"Validation Final Wealth: "
+        f"{summary['validation_final_wealth']:.6f}"
     )
     print(
         f"Test Combined: "
