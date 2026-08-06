@@ -1,1 +1,1 @@
-"""Residual Collective Risk-Aware DFL implementation."""
+"""Residual Collective Risk-aware Decision-Focused Learning implementation."""

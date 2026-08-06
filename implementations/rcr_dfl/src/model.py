@@ -5,12 +5,7 @@ from torch import nn
 
 
 class ReturnMLP(nn.Module):
-    """
-    과거 수익률을 입력받아 다음 거래일 자산별 수익률을 예측한다.
-
-    입력: [B, lookback, N]
-    출력: [B, N]
-    """
+    """과거 수익률 [B, lookback, N]을 다음 거래일 수익률 [B, N]으로 변환한다."""
 
     def __init__(
         self,
@@ -21,22 +16,13 @@ class ReturnMLP(nn.Module):
     ) -> None:
         super().__init__()
         if n_assets <= 0:
-            raise ValueError(
-                f"n_assets는 0보다 커야 합니다: {n_assets}"
-            )
+            raise ValueError(f"n_assets는 0보다 커야 합니다: {n_assets}")
         if lookback <= 0:
-            raise ValueError(
-                f"lookback은 0보다 커야 합니다: {lookback}"
-            )
+            raise ValueError(f"lookback은 0보다 커야 합니다: {lookback}")
         if hidden_dim <= 0:
-            raise ValueError(
-                f"hidden_dim은 0보다 커야 합니다: {hidden_dim}"
-            )
+            raise ValueError(f"hidden_dim은 0보다 커야 합니다: {hidden_dim}")
         if not 0.0 <= dropout < 1.0:
-            raise ValueError(
-                f"dropout은 0 이상 1 미만이어야 합니다: {dropout}"
-            )
-
+            raise ValueError(f"dropout은 0 이상 1 미만이어야 합니다: {dropout}")
         input_dim = lookback * n_assets
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
