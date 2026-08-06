@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 
 from .decision_model import RCRMLPWithMarkowitz
 from .losses import compute_rcr_losses
+from .residual_risk import matrix_diagnostics
 
 
 @dataclass(frozen=True)
@@ -21,7 +22,9 @@ class EpochMetrics:
     weight_sum_error: float
     minimum_weight: float
     maximum_weight: float
+    maximum_effective_symmetry_error: float
     minimum_effective_eigenvalue: float
+    maximum_effective_condition_number: float
     n_samples: int
 
 
@@ -36,11 +39,9 @@ class TrainingResult:
 
 def _gradient_norm(parameters: list[torch.nn.Parameter]) -> float:
     squared_norm = 0.0
-
     for parameter in parameters:
         if parameter.grad is not None:
             squared_norm += parameter.grad.detach().norm(2).item() ** 2
-
     return squared_norm**0.5
 
 
@@ -48,28 +49,11 @@ def _move_batch(
     batch: dict[str, Any],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    features = batch["features"].to(
-        device=device,
-        dtype=torch.float32,
-        non_blocking=False,
-    )
-    targets = batch["target"].to(
-        device=device,
-        dtype=torch.float32,
-        non_blocking=False,
-    )
-
-    # CVXPYLayer는 CPU float64를 사용한다.
-    covariance = batch["covariance"].to(
-        device="cpu",
-        dtype=torch.float64,
-    )
-    residual_covariance = batch["residual_covariance"].to(
-        device="cpu",
-        dtype=torch.float64,
-    )
-
-    return features, targets, covariance, residual_covariance
+    features = batch["features"].to(device=device, dtype=torch.float32, non_blocking=False)
+    targets = batch["target"].to(device=device, dtype=torch.float32, non_blocking=False)
+    covariance = batch["covariance"].to(device="cpu", dtype=torch.float64)
+    a_res = batch["a_res"].to(device="cpu", dtype=torch.float64)
+    return features, targets, covariance, a_res
 
 
 def run_epoch(
@@ -83,50 +67,30 @@ def run_epoch(
     max_batches: int | None = None,
 ) -> EpochMetrics:
     if max_batches is not None and max_batches <= 0:
-        raise ValueError(
-            f"max_batches는 None 또는 0보다 커야 합니다: {max_batches}"
-        )
+        raise ValueError(f"max_batches는 None 또는 0보다 커야 합니다: {max_batches}")
 
     training = optimizer is not None
     model.train(training)
-
-    total_sum = 0.0
-    mse_sum = 0.0
-    regret_sum = 0.0
-    gradient_norm_sum = 0.0
-
+    total_sum = mse_sum = regret_sum = gradient_norm_sum = 0.0
     weight_sum_error = 0.0
     minimum_weight = float("inf")
     maximum_weight = float("-inf")
+    maximum_effective_symmetry_error = 0.0
     minimum_effective_eigenvalue = float("inf")
-
+    maximum_effective_condition_number = 0.0
     n_samples = 0
 
     for batch_index, batch in enumerate(dataloader):
         if max_batches is not None and batch_index >= max_batches:
             break
-
-        features, targets, covariance, residual_covariance = _move_batch(
-            batch,
-            device,
-        )
+        features, targets, covariance, a_res = _move_batch(batch, device)
         batch_size = features.size(0)
-
         if training:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(training):
-            output = model(
-                features=features,
-                covariance=covariance,
-                residual_covariance=residual_covariance,
-            )
-
-            oracle_weights = model.solve_oracle(
-                true_returns=targets,
-                risk_factor=output.risk_factor,
-            )
-
+            output = model(features=features, covariance=covariance, a_res=a_res)
+            oracle_weights = model.solve_oracle(true_returns=targets, risk_factor=output.risk_factor)
             losses = compute_rcr_losses(
                 predicted_returns=output.predicted_returns,
                 predicted_weights=output.predicted_weights,
@@ -138,64 +102,46 @@ def run_epoch(
             )
 
         batch_gradient_norm = 0.0
-
         if training:
             losses.total.backward()
-
             parameters = [
-                parameter
-                for parameter in model.return_model.parameters()
-                if parameter.requires_grad
+                parameter for parameter in model.return_model.parameters() if parameter.requires_grad
             ]
-
             batch_gradient_norm = _gradient_norm(parameters)
-
             if gradient_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    parameters,
-                    gradient_clip_norm,
-                )
-
+                torch.nn.utils.clip_grad_norm_(parameters, gradient_clip_norm)
             optimizer.step()
 
         predicted_weights = output.predicted_weights.detach()
         effective_covariance = output.effective_covariance.detach()
-
+        diagnostics = matrix_diagnostics(effective_covariance)
         total_sum += losses.total.detach().item() * batch_size
         mse_sum += losses.mse.detach().item() * batch_size
         regret_sum += losses.regret.detach().item() * batch_size
         gradient_norm_sum += batch_gradient_norm * batch_size
         n_samples += batch_size
 
-        batch_weight_sum_error = (
-            predicted_weights.sum(dim=-1) - 1.0
-        ).abs().max().item()
-
         weight_sum_error = max(
             weight_sum_error,
-            batch_weight_sum_error,
+            (predicted_weights.sum(dim=-1) - 1.0).abs().max().item(),
         )
-        minimum_weight = min(
-            minimum_weight,
-            predicted_weights.min().item(),
+        minimum_weight = min(minimum_weight, predicted_weights.min().item())
+        maximum_weight = max(maximum_weight, predicted_weights.max().item())
+        maximum_effective_symmetry_error = max(
+            maximum_effective_symmetry_error,
+            diagnostics.symmetry_error.max().item(),
         )
-        maximum_weight = max(
-            maximum_weight,
-            predicted_weights.max().item(),
-        )
-
-        batch_minimum_eigenvalue = torch.linalg.eigvalsh(
-            effective_covariance
-        ).min().item()
-
         minimum_effective_eigenvalue = min(
             minimum_effective_eigenvalue,
-            batch_minimum_eigenvalue,
+            diagnostics.minimum_eigenvalue.min().item(),
+        )
+        maximum_effective_condition_number = max(
+            maximum_effective_condition_number,
+            diagnostics.condition_number.max().item(),
         )
 
     if n_samples == 0:
         raise RuntimeError("DataLoader에 sample이 없습니다.")
-
     return EpochMetrics(
         total_loss=total_sum / n_samples,
         mse=mse_sum / n_samples,
@@ -204,7 +150,9 @@ def run_epoch(
         weight_sum_error=weight_sum_error,
         minimum_weight=minimum_weight,
         maximum_weight=maximum_weight,
+        maximum_effective_symmetry_error=maximum_effective_symmetry_error,
         minimum_effective_eigenvalue=minimum_effective_eigenvalue,
+        maximum_effective_condition_number=maximum_effective_condition_number,
         n_samples=n_samples,
     )
 
@@ -218,7 +166,6 @@ def save_checkpoint(
     metadata: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-
     torch.save(
         {
             "epoch": epoch,
@@ -250,33 +197,20 @@ def fit(
     max_test_batches: int | None = None,
 ) -> TrainingResult:
     if epochs <= 0:
-        raise ValueError(
-            f"epochs는 0보다 커야 합니다: {epochs}"
-        )
-
+        raise ValueError(f"epochs는 0보다 커야 합니다: {epochs}")
     if patience <= 0:
-        raise ValueError(
-            f"patience는 0보다 커야 합니다: {patience}"
-        )
-
+        raise ValueError(f"patience는 0보다 커야 합니다: {patience}")
     if gradient_clip_norm is not None and gradient_clip_norm <= 0:
-        raise ValueError(
-            "gradient_clip_norm은 None 또는 0보다 큰 값이어야 합니다: "
-            f"{gradient_clip_norm}"
-        )
+        raise ValueError("gradient_clip_norm은 None 또는 0보다 큰 값이어야 합니다.")
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-
     checkpoint_path = output_path / "best_model.pt"
     history_path = output_path / "history.csv"
-
     model.to(device)
-
     best_epoch = 0
     best_validation_loss = float("inf")
     epochs_without_improvement = 0
-
     history_rows: list[dict[str, float | int]] = []
     checkpoint_metadata = {} if metadata is None else metadata
 
@@ -291,7 +225,6 @@ def fit(
             gradient_clip_norm=gradient_clip_norm,
             max_batches=max_train_batches,
         )
-
         validation_metrics = run_epoch(
             model=model,
             dataloader=validation_loader,
@@ -300,74 +233,40 @@ def fit(
             mse_scale=mse_scale,
             max_batches=max_validation_batches,
         )
-
-        row: dict[str, float | int] = {
-            "epoch": epoch,
-        }
-
-        row.update(
-            {
-                f"train_{key}": value
-                for key, value in asdict(train_metrics).items()
-            }
-        )
-        row.update(
-            {
-                f"validation_{key}": value
-                for key, value in asdict(validation_metrics).items()
-            }
-        )
-
+        row: dict[str, float | int] = {"epoch": epoch}
+        row.update({f"train_{key}": value for key, value in asdict(train_metrics).items()})
+        row.update({f"validation_{key}": value for key, value in asdict(validation_metrics).items()})
         history_rows.append(row)
-
-        pd.DataFrame(history_rows).to_csv(
-            history_path,
-            index=False,
-        )
+        pd.DataFrame(history_rows).to_csv(history_path, index=False)
 
         print(
-            f"Epoch {epoch:03d} | "
-            f"Train Total: {train_metrics.total_loss:.8f} | "
-            f"Train MSE: {train_metrics.mse:.8f} | "
-            f"Train RCR: {train_metrics.regret:.8f} | "
-            f"Val Total: {validation_metrics.total_loss:.8f} | "
-            f"Val MSE: {validation_metrics.mse:.8f} | "
-            f"Val RCR: {validation_metrics.regret:.8f} | "
-            f"Grad: {train_metrics.gradient_norm:.3e}"
+            f"Epoch {epoch:03d} | Train Total: {train_metrics.total_loss:.8f} | "
+            f"Train MSE: {train_metrics.mse:.8f} | Train RCR: {train_metrics.regret:.8f} | "
+            f"Val Total: {validation_metrics.total_loss:.8f} | Val MSE: {validation_metrics.mse:.8f} | "
+            f"Val RCR: {validation_metrics.regret:.8f} | Grad: {train_metrics.gradient_norm:.3e} | "
+            f"MinEig: {validation_metrics.minimum_effective_eigenvalue:.3e} | "
+            f"Cond: {validation_metrics.maximum_effective_condition_number:.3e}"
         )
-
         if validation_metrics.total_loss < best_validation_loss:
             best_validation_loss = validation_metrics.total_loss
             best_epoch = epoch
             epochs_without_improvement = 0
-
             save_checkpoint(
-                path=checkpoint_path,
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                validation_loss=best_validation_loss,
-                metadata=checkpoint_metadata,
+                checkpoint_path,
+                model,
+                optimizer,
+                epoch,
+                best_validation_loss,
+                checkpoint_metadata,
             )
         else:
             epochs_without_improvement += 1
-
         if epochs_without_improvement >= patience:
-            print(
-                f"Early stopping: {patience} epoch 동안 "
-                "validation loss가 개선되지 않았습니다."
-            )
+            print(f"Early stopping: {patience} epoch 동안 validation loss가 개선되지 않았습니다.")
             break
 
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location=device,
-        weights_only=False,
-    )
-    model.load_state_dict(
-        checkpoint["model_state_dict"]
-    )
-
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
     test_metrics = run_epoch(
         model=model,
         dataloader=test_loader,
@@ -376,22 +275,13 @@ def fit(
         mse_scale=mse_scale,
         max_batches=max_test_batches,
     )
-
-    pd.DataFrame(
-        [asdict(test_metrics)]
-    ).to_csv(
-        output_path / "test_metrics.csv",
-        index=False,
-    )
-
+    pd.DataFrame([asdict(test_metrics)]).to_csv(output_path / "test_metrics.csv", index=False)
     print(
-        f"Best Epoch: {best_epoch:03d} | "
-        f"Best Val Total: {best_validation_loss:.8f} | "
-        f"Test Total: {test_metrics.total_loss:.8f} | "
-        f"Test MSE: {test_metrics.mse:.8f} | "
-        f"Test RCR: {test_metrics.regret:.8f}"
+        f"Best Epoch: {best_epoch:03d} | Best Val Total: {best_validation_loss:.8f} | "
+        f"Test Total: {test_metrics.total_loss:.8f} | Test MSE: {test_metrics.mse:.8f} | "
+        f"Test RCR: {test_metrics.regret:.8f} | Test MinEig: {test_metrics.minimum_effective_eigenvalue:.3e} | "
+        f"Test Cond: {test_metrics.maximum_effective_condition_number:.3e}"
     )
-
     return TrainingResult(
         best_epoch=best_epoch,
         best_validation_loss=best_validation_loss,

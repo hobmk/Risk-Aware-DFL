@@ -10,9 +10,14 @@ from .losses import (
 )
 from .model import ReturnMLP
 from .residual_risk import (
+    CorrelationScaling,
+    MatrixDiagnostics,
     correlation_matrix,
     covariance_matrix,
+    matrix_diagnostics,
     normalize_covariance_trace,
+    scale_correlation_to_covariance,
+    shrink_correlation,
 )
 
 __all__ = [
@@ -20,9 +25,14 @@ __all__ = [
     "fit_capm",
     "RCRRollingMVODataset",
     "chronological_split",
+    "CorrelationScaling",
+    "MatrixDiagnostics",
     "covariance_matrix",
     "correlation_matrix",
+    "shrink_correlation",
+    "scale_correlation_to_covariance",
     "normalize_covariance_trace",
+    "matrix_diagnostics",
     "build_effective_covariance",
     "project_to_psd",
     "RCRLossOutput",

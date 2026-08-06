@@ -4,31 +4,19 @@ import torch
 pytest.importorskip("cvxpy")
 pytest.importorskip("cvxpylayers")
 
-from implementations.rcr_dfl.src.decision_model import (
-    RCRMLPWithMarkowitz,
-)
+from implementations.rcr_dfl.src.decision_model import RCRMLPWithMarkowitz
 from implementations.rcr_dfl.src.losses import compute_rcr_losses
+from implementations.rcr_dfl.src.residual_risk import scale_correlation_to_covariance
 
 
 def _spd(batch_size: int, n_assets: int) -> torch.Tensor:
-    matrix = torch.randn(
-        batch_size,
-        n_assets,
-        n_assets,
-        dtype=torch.float64,
-    )
-    return (
-        matrix @ matrix.transpose(-1, -2)
-        + 0.1 * torch.eye(n_assets, dtype=torch.float64)
-    )
+    matrix = torch.randn(batch_size, n_assets, n_assets, dtype=torch.float64)
+    return matrix @ matrix.transpose(-1, -2) + 0.1 * torch.eye(n_assets, dtype=torch.float64)
 
 
 def test_decision_model_backward_reaches_mlp() -> None:
     torch.manual_seed(29)
-    batch_size = 2
-    lookback = 5
-    n_assets = 3
-
+    batch_size, lookback, n_assets = 2, 5, 3
     model = RCRMLPWithMarkowitz(
         n_assets=n_assets,
         lookback=lookback,
@@ -40,17 +28,10 @@ def test_decision_model_backward_reaches_mlp() -> None:
     features = torch.randn(batch_size, lookback, n_assets)
     targets = torch.randn(batch_size, n_assets) * 0.01
     covariance = _spd(batch_size, n_assets)
-    residual_covariance = _spd(batch_size, n_assets)
-
-    output = model(
-        features=features,
-        covariance=covariance,
-        residual_covariance=residual_covariance,
-    )
-    oracle_weights = model.solve_oracle(
-        true_returns=targets,
-        risk_factor=output.risk_factor,
-    )
+    correlation = torch.eye(n_assets, dtype=torch.float64).expand(batch_size, -1, -1).clone()
+    a_res = scale_correlation_to_covariance(correlation, covariance, scaling="trace")
+    output = model(features=features, covariance=covariance, a_res=a_res)
+    oracle_weights = model.solve_oracle(targets, output.risk_factor)
     losses = compute_rcr_losses(
         predicted_returns=output.predicted_returns,
         predicted_weights=output.predicted_weights,
@@ -61,11 +42,6 @@ def test_decision_model_backward_reaches_mlp() -> None:
         mse_scale=15.0,
     )
     losses.total.backward()
-
-    gradients = [
-        parameter.grad
-        for parameter in model.return_model.parameters()
-        if parameter.grad is not None
-    ]
+    gradients = [p.grad for p in model.return_model.parameters() if p.grad is not None]
     assert gradients
     assert all(torch.isfinite(gradient).all() for gradient in gradients)

@@ -1,1 +1,1 @@
-"""Executable diagnostic scripts for RCR-DFL."""
+"""Executable validation, analysis, and training scripts for RCR-DFL."""

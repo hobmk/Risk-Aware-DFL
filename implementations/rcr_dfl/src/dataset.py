@@ -9,7 +9,13 @@ import torch
 from torch.utils.data import Dataset, Subset
 
 from .capm import fit_capm
-from .residual_risk import covariance_matrix
+from .residual_risk import (
+    CorrelationScaling,
+    correlation_matrix,
+    covariance_matrix,
+    scale_correlation_to_covariance,
+    shrink_correlation,
+)
 
 ReturnType = Literal["simple", "log"]
 MarketMode = Literal["equal_weight", "external"]
@@ -17,20 +23,20 @@ MarketMode = Literal["equal_weight", "external"]
 
 class RCRRollingMVODataset(Dataset):
     """
-    기존 RollingMVODataset의 feature/target/covariance 정렬을 유지하면서
-    rolling CAPM과 residual covariance를 추가한 Dataset.
+    기존 RollingMVODataset 정렬을 유지하면서 rolling CAPM과 residual correlation을 생성한다.
 
-    각 sample의 주요 반환값
-    -------------------------
-    features: [lookback, n_assets]
-    target: [n_assets]
-    covariance: [n_assets, n_assets]
-    market_window: [lookback]
-    capm_alpha: [n_assets]
-    capm_beta: [n_assets]
-    residuals: [lookback, n_assets]
-    residual_covariance: [n_assets, n_assets]
-    target_date: str
+    각 시점 t에서:
+        C_res,t = Corr(epsilon_t)
+        C_bar,t = (1-rho) C_res,t + rho I
+        A_res,t = tr(Sigma_t) / N * C_bar,t       (correlation_scaling="trace")
+
+    주요 반환값:
+        features: [lookback, N]
+        target: [N]
+        covariance: Sigma_t, [N, N]
+        residual_correlation_raw: C_res,t, [N, N]
+        residual_correlation: C_bar,t, [N, N]
+        a_res: covariance 단위로 변환된 A_res,t, [N, N]
     """
 
     def __init__(
@@ -45,6 +51,9 @@ class RCRRollingMVODataset(Dataset):
         market_column: str | None = None,
         risk_free_rate: float = 0.0,
         fit_intercept: bool = True,
+        residual_correlation_shrinkage: float = 0.1,
+        correlation_scaling: CorrelationScaling = "trace",
+        correlation_eps: float = 1e-12,
         dtype: torch.dtype = torch.float64,
     ) -> None:
         super().__init__()
@@ -60,6 +69,12 @@ class RCRRollingMVODataset(Dataset):
             raise ValueError("market_mode='external'이면 market_price_csv가 필요합니다.")
         if not np.isfinite(risk_free_rate):
             raise ValueError("risk_free_rate는 유한한 값이어야 합니다.")
+        if not 0.0 <= residual_correlation_shrinkage <= 1.0:
+            raise ValueError("residual_correlation_shrinkage는 0 이상 1 이하여야 합니다.")
+        if correlation_scaling not in {"none", "trace"}:
+            raise ValueError("correlation_scaling은 'none' 또는 'trace'여야 합니다.")
+        if correlation_eps <= 0:
+            raise ValueError("correlation_eps는 0보다 커야 합니다.")
 
         self.price_csv = Path(price_csv)
         self.lookback = lookback
@@ -71,6 +86,9 @@ class RCRRollingMVODataset(Dataset):
         self.market_column = market_column
         self.risk_free_rate = float(risk_free_rate)
         self.fit_intercept = fit_intercept
+        self.residual_correlation_shrinkage = residual_correlation_shrinkage
+        self.correlation_scaling = correlation_scaling
+        self.correlation_eps = correlation_eps
         self.dtype = dtype
 
         asset_prices = self._load_price_frame(self.price_csv, minimum_columns=2, label="자산")
@@ -108,22 +126,14 @@ class RCRRollingMVODataset(Dataset):
         self.market_returns = market_returns.to_numpy(dtype=np.float64)
         self.return_dates = pd.DatetimeIndex(asset_returns.index)
         self.target_positions = np.arange(lookback, len(asset_returns), dtype=np.int64)
-
         self._precompute_risk_inputs()
 
-    def _load_price_frame(
-        self,
-        path: Path | None,
-        minimum_columns: int,
-        label: str,
-    ) -> pd.DataFrame:
+    def _load_price_frame(self, path: Path | None, minimum_columns: int, label: str) -> pd.DataFrame:
         if path is None or not path.exists():
             raise FileNotFoundError(f"{label} 가격 CSV를 찾을 수 없습니다: {path}")
-
         dataframe = pd.read_csv(path)
         if self.date_column not in dataframe.columns:
             raise ValueError(f"{label} CSV에 날짜 열 '{self.date_column}'이 없습니다.")
-
         dataframe[self.date_column] = pd.to_datetime(dataframe[self.date_column], errors="raise")
         dataframe = dataframe.set_index(self.date_column).sort_index()
         if dataframe.index.has_duplicates:
@@ -131,7 +141,6 @@ class RCRRollingMVODataset(Dataset):
             raise ValueError(f"{label} 가격 CSV에 중복 날짜가 존재합니다: {duplicated[:5].tolist()}")
         if dataframe.shape[1] < minimum_columns:
             raise ValueError(f"{label} 가격 CSV에는 최소 {minimum_columns}개 가격 열이 필요합니다.")
-
         dataframe = dataframe.apply(pd.to_numeric, errors="raise")
         missing_count = int(dataframe.isna().sum().sum())
         if missing_count > 0:
@@ -158,11 +167,7 @@ class RCRRollingMVODataset(Dataset):
         return market_prices[column].rename(column)
 
     def _calculate_returns(self, prices: pd.DataFrame) -> pd.DataFrame:
-        if self.return_type == "simple":
-            returns = prices.pct_change(fill_method=None)
-        else:
-            returns = np.log(prices / prices.shift(1))
-
+        returns = prices.pct_change(fill_method=None) if self.return_type == "simple" else np.log(prices / prices.shift(1))
         returns = returns.iloc[1:]
         if returns.isna().any().any():
             raise ValueError("수익률 계산 후 결측치가 발생했습니다.")
@@ -172,15 +177,11 @@ class RCRRollingMVODataset(Dataset):
 
     def _precompute_risk_inputs(self) -> None:
         asset_windows = np.lib.stride_tricks.sliding_window_view(
-            self.returns,
-            window_shape=self.lookback,
-            axis=0,
+            self.returns, window_shape=self.lookback, axis=0
         ).transpose(0, 2, 1)[:-1]
         market_windows = np.lib.stride_tricks.sliding_window_view(
-            self.market_returns,
-            window_shape=self.lookback,
+            self.market_returns, window_shape=self.lookback
         )[:-1]
-
         asset_windows_tensor = torch.from_numpy(np.ascontiguousarray(asset_windows)).to(self.dtype)
         market_windows_tensor = torch.from_numpy(np.ascontiguousarray(market_windows)).to(self.dtype)
 
@@ -191,15 +192,28 @@ class RCRRollingMVODataset(Dataset):
             fit_intercept=self.fit_intercept,
         )
         covariance = covariance_matrix(asset_windows_tensor)
-        residual_covariance = covariance_matrix(capm.residuals)
-
         eye = torch.eye(self.n_assets, dtype=self.dtype).unsqueeze(0)
         covariance = covariance + self.covariance_jitter * eye
+
+        residual_correlation_raw = correlation_matrix(
+            capm.residuals, eps=self.correlation_eps
+        )
+        residual_correlation = shrink_correlation(
+            residual_correlation_raw,
+            shrinkage=self.residual_correlation_shrinkage,
+        )
+        a_res = scale_correlation_to_covariance(
+            correlation=residual_correlation,
+            reference_covariance=covariance,
+            scaling=self.correlation_scaling,
+        )
 
         self.capm_alpha = capm.alpha.contiguous()
         self.capm_beta = capm.beta.contiguous()
         self.covariances = covariance.contiguous()
-        self.residual_covariances = residual_covariance.contiguous()
+        self.residual_correlations_raw = residual_correlation_raw.contiguous()
+        self.residual_correlations = residual_correlation.contiguous()
+        self.a_res_matrices = a_res.contiguous()
 
     def __len__(self) -> int:
         return len(self.target_positions)
@@ -207,19 +221,15 @@ class RCRRollingMVODataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         target_position = int(self.target_positions[index])
         start_position = target_position - self.lookback
-        end_position = target_position
-
-        features = torch.tensor(self.returns[start_position:end_position], dtype=self.dtype)
+        features = torch.tensor(self.returns[start_position:target_position], dtype=self.dtype)
         target = torch.tensor(self.returns[target_position], dtype=self.dtype)
-        market_window = torch.tensor(self.market_returns[start_position:end_position], dtype=self.dtype)
+        market_window = torch.tensor(self.market_returns[start_position:target_position], dtype=self.dtype)
         alpha = self.capm_alpha[index]
         beta = self.capm_beta[index]
-
         asset_excess = features - self.risk_free_rate
         market_excess = market_window - self.risk_free_rate
         residuals = asset_excess - alpha.unsqueeze(0) - market_excess.unsqueeze(-1) * beta.unsqueeze(0)
         target_date = self.return_dates[target_position]
-
         return {
             "features": features,
             "target": target,
@@ -228,7 +238,9 @@ class RCRRollingMVODataset(Dataset):
             "capm_alpha": alpha,
             "capm_beta": beta,
             "residuals": residuals,
-            "residual_covariance": self.residual_covariances[index],
+            "residual_correlation_raw": self.residual_correlations_raw[index],
+            "residual_correlation": self.residual_correlations[index],
+            "a_res": self.a_res_matrices[index],
             "target_date": target_date.strftime("%Y-%m-%d"),
         }
 
@@ -247,14 +259,12 @@ def chronological_split(
     validation_end_timestamp = pd.Timestamp(validation_end)
     if train_end_timestamp >= validation_end_timestamp:
         raise ValueError("train_end는 validation_end보다 빨라야 합니다.")
-
     target_dates = dataset.target_dates
     train_indices = np.flatnonzero(target_dates <= train_end_timestamp).tolist()
     validation_indices = np.flatnonzero(
         (target_dates > train_end_timestamp) & (target_dates <= validation_end_timestamp)
     ).tolist()
     test_indices = np.flatnonzero(target_dates > validation_end_timestamp).tolist()
-
     if not train_indices:
         raise ValueError("Train sample이 없습니다.")
     if not validation_indices:
