@@ -1,5 +1,10 @@
 from .capm import CAPMResult, fit_capm
-from .dataset import RCRRollingMVODataset, chronological_split
+from .dataset import (
+    FeatureStandardizedSubset,
+    RCRRollingMVODataset,
+    chronological_split,
+    fit_feature_standardizer,
+)
 from .effective_covariance import build_effective_covariance, project_to_psd
 from .losses import (
     RCRLossOutput,
@@ -24,6 +29,8 @@ __all__ = [
     "CAPMResult",
     "fit_capm",
     "RCRRollingMVODataset",
+    "FeatureStandardizedSubset",
+    "fit_feature_standardizer",
     "chronological_split",
     "CorrelationScaling",
     "MatrixDiagnostics",

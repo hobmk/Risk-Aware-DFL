@@ -40,3 +40,17 @@ def test_matrix_diagnostics_condition_number() -> None:
     assert diagnostics.minimum_eigenvalue.item() == 1.0
     assert diagnostics.maximum_eigenvalue.item() == 4.0
     assert diagnostics.condition_number.item() == 4.0
+
+def test_zero_shrinkage_returns_original_correlation() -> None:
+    correlation = torch.tensor(
+        [
+            [1.0, 0.8, -0.3],
+            [0.8, 1.0, 0.2],
+            [-0.3, 0.2, 1.0],
+        ],
+        dtype=torch.float64,
+    )
+
+    unshrunk = shrink_correlation(correlation, shrinkage=0.0)
+
+    assert torch.allclose(unshrunk, correlation, atol=1e-12)
