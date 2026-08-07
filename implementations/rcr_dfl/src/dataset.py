@@ -51,7 +51,7 @@ class RCRRollingMVODataset(Dataset):
         market_column: str | None = None,
         risk_free_rate: float = 0.0,
         fit_intercept: bool = True,
-        residual_correlation_shrinkage: float = 0.1,
+        residual_correlation_shrinkage: float = 0.0,
         correlation_scaling: CorrelationScaling = "trace",
         correlation_eps: float = 1e-12,
         dtype: torch.dtype = torch.float64,
@@ -272,3 +272,86 @@ def chronological_split(
     if not test_indices:
         raise ValueError("Test sample이 없습니다.")
     return Subset(dataset, train_indices), Subset(dataset, validation_indices), Subset(dataset, test_indices)
+
+
+
+class FeatureStandardizedSubset(Dataset):
+    """Subset의 features만 Train 통계로 표준화하고 나머지 값은 원 단위로 유지한다."""
+
+    def __init__(
+        self,
+        subset: Subset,
+        feature_mean: torch.Tensor,
+        feature_std: torch.Tensor,
+    ) -> None:
+        if feature_mean.ndim != 1 or feature_std.ndim != 1:
+            raise ValueError("feature_mean과 feature_std는 1차원이어야 합니다.")
+        if feature_mean.shape != feature_std.shape:
+            raise ValueError("feature_mean과 feature_std의 shape이 같아야 합니다.")
+        if torch.any(feature_std <= 0):
+            raise ValueError("feature_std는 모두 0보다 커야 합니다.")
+
+        self.subset = subset
+        self.feature_mean = feature_mean
+        self.feature_std = feature_std
+
+    def __len__(self) -> int:
+        return len(self.subset)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        sample = dict(self.subset[index])
+        sample["features"] = (
+            sample["features"] - self.feature_mean
+        ) / self.feature_std
+        return sample
+
+
+def fit_feature_standardizer(
+    dataset: RCRRollingMVODataset,
+    train_subset: Subset,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Train sample의 입력 window에 포함된 수익률만으로 종목별 통계를 계산한다."""
+
+    if eps <= 0:
+        raise ValueError("eps는 0보다 커야 합니다.")
+
+    feature_positions: list[int] = []
+
+    for sample_index in train_subset.indices:
+        target_position = int(
+            dataset.target_positions[int(sample_index)]
+        )
+        feature_positions.extend(
+            range(
+                target_position - dataset.lookback,
+                target_position,
+            )
+        )
+
+    unique_positions = np.unique(
+        np.asarray(feature_positions, dtype=np.int64)
+    )
+
+    if unique_positions.size == 0:
+        raise ValueError("표준화 통계를 계산할 Train feature가 없습니다.")
+
+    train_features = dataset.returns[unique_positions]
+    feature_mean = train_features.mean(axis=0)
+    feature_std = train_features.std(axis=0, ddof=0)
+
+    if not np.isfinite(feature_mean).all():
+        raise ValueError("입력 표준화 평균에 비정상 값이 있습니다.")
+    if not np.isfinite(feature_std).all():
+        raise ValueError("입력 표준화 표준편차에 비정상 값이 있습니다.")
+
+    feature_std = np.where(
+        feature_std < eps,
+        1.0,
+        feature_std,
+    )
+
+    return (
+        torch.tensor(feature_mean, dtype=dataset.dtype),
+        torch.tensor(feature_std, dtype=dataset.dtype),
+    )

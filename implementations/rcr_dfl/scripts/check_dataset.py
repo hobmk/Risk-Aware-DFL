@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--return-type", choices=["simple", "log"], default="simple")
     parser.add_argument("--covariance-jitter", type=float, default=1e-6)
     parser.add_argument("--risk-free-rate", type=float, default=0.0)
-    parser.add_argument("--residual-correlation-shrinkage", type=float, default=0.1)
+    parser.add_argument("--residual-correlation-shrinkage", type=float, default=0.0)
     parser.add_argument("--correlation-scaling", choices=["none", "trace"], default="trace")
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--eta", type=float, default=0.5)

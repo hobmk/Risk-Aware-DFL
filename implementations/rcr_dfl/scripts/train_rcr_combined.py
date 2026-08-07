@@ -10,9 +10,15 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from implementations.rcr_dfl.src.dataset import RCRRollingMVODataset, chronological_split
+from implementations.rcr_dfl.src.dataset import (
+    FeatureStandardizedSubset,
+    RCRRollingMVODataset,
+    chronological_split,
+    fit_feature_standardizer,
+)
 from implementations.rcr_dfl.src.decision_model import RCRMLPWithMarkowitz
 from implementations.rcr_dfl.src.trainer import fit
+from implementations.rcr_dfl.src.reporting import generate_run_report
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,10 +33,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--market-column", default=None)
     parser.add_argument("--risk-free-rate", type=float, default=0.0)
     parser.add_argument("--no-capm-intercept", action="store_true", help="CAPM alpha를 0으로 고정합니다.")
-    parser.add_argument("--residual-correlation-shrinkage", type=float, default=0.1)
+    parser.add_argument("--residual-correlation-shrinkage", type=float, default=0.0)
     parser.add_argument("--correlation-scaling", choices=["none", "trace"], default="trace")
     parser.add_argument("--train-end", default="2021-12-31")
     parser.add_argument("--validation-end", default="2022-12-31")
+    parser.add_argument(
+        "--standardize-inputs",
+        action="store_true",
+        help="Train 구간 통계로 MLP 입력 features만 종목별 표준화합니다.",
+    )
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--risk-aversion", type=float, default=1.0)
@@ -55,6 +66,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--make-report",
+        action="store_true",
+        help="Best checkpoint로 포트폴리오 성과와 그래프를 자동 생성합니다.",
+    )
+    parser.add_argument(
+        "--baseline-run-dir",
+        default=None,
+        help="비교할 기존 DFL-MVO seed 실행 폴더입니다.",
+    )
+    parser.add_argument(
+        "--baseline-label",
+        default="DFL-MVO",
+    )
+    parser.add_argument(
+        "--active-threshold",
+        type=float,
+        default=1e-3,
+    )
+    parser.add_argument(
+        "--cap-tolerance",
+        type=float,
+        default=1e-4,
+    )
+    parser.add_argument(
+        "--report-dpi",
+        type=int,
+        default=300,
+    )
     return parser.parse_args()
 
 
@@ -99,6 +139,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("batch_size는 0보다 커야 합니다.")
     if args.num_workers != 0:
         raise ValueError("현재 단계에서는 Windows와 CVXPYLayer 안정성을 위해 --num-workers 0만 사용하세요.")
+    if args.active_threshold < 0:
+        raise ValueError("active-threshold는 0 이상이어야 합니다.")
+    if args.cap_tolerance < 0:
+        raise ValueError("cap-tolerance는 0 이상이어야 합니다.")
+    if args.report_dpi <= 0:
+        raise ValueError("report-dpi는 0보다 커야 합니다.")
+    if args.baseline_run_dir is not None and not args.make_report:
+        raise ValueError(
+            "--baseline-run-dir를 사용하려면 --make-report도 함께 지정하세요."
+        )
+
     if args.correlation_scaling == "none":
         print("WARNING: correlation-scaling=none은 Sigma와 A_res의 단위가 다르므로 진단용으로만 권장합니다.")
 
@@ -130,11 +181,40 @@ def main() -> None:
         correlation_scaling=args.correlation_scaling,
         dtype=torch.float64,
     )
-    train_dataset, validation_dataset, test_dataset = chronological_split(
+    train_subset, validation_subset, test_subset = chronological_split(
         dataset=dataset,
         train_end=args.train_end,
         validation_end=args.validation_end,
     )
+
+    feature_mean: torch.Tensor | None = None
+    feature_std: torch.Tensor | None = None
+
+    if args.standardize_inputs:
+        feature_mean, feature_std = fit_feature_standardizer(
+            dataset=dataset,
+            train_subset=train_subset,
+        )
+        train_dataset = FeatureStandardizedSubset(
+            train_subset,
+            feature_mean,
+            feature_std,
+        )
+        validation_dataset = FeatureStandardizedSubset(
+            validation_subset,
+            feature_mean,
+            feature_std,
+        )
+        test_dataset = FeatureStandardizedSubset(
+            test_subset,
+            feature_mean,
+            feature_std,
+        )
+    else:
+        train_dataset = train_subset
+        validation_dataset = validation_subset
+        test_dataset = test_subset
+
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
         train_dataset,
@@ -177,6 +257,23 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
+    standardizer_path: Path | None = None
+
+    if args.standardize_inputs:
+        if feature_mean is None or feature_std is None:
+            raise RuntimeError("표준화 통계가 생성되지 않았습니다.")
+
+        standardizer_path = output_dir / "feature_standardizer.pt"
+        torch.save(
+            {
+                "feature_mean": feature_mean,
+                "feature_std": feature_std,
+                "tickers": dataset.tickers,
+                "train_end": args.train_end,
+            },
+            standardizer_path,
+        )
+
     config = vars(args).copy()
     config.update(
         {
@@ -189,6 +286,21 @@ def main() -> None:
             "test_samples": len(test_dataset),
             "first_target_date": str(dataset.target_dates[0].date()),
             "last_target_date": str(dataset.target_dates[-1].date()),
+            "feature_standardizer_file": (
+                standardizer_path.name
+                if standardizer_path is not None
+                else None
+            ),
+            "feature_mean": (
+                feature_mean.tolist()
+                if feature_mean is not None
+                else None
+            ),
+            "feature_std": (
+                feature_std.tolist()
+                if feature_std is not None
+                else None
+            ),
             "a_res_definition": "tr(Sigma)/N * shrunk residual correlation",
         }
     )
@@ -198,6 +310,18 @@ def main() -> None:
     print(f"device: {device}")
     print(f"assets: {dataset.n_assets}")
     print(f"market: {dataset.market_name}")
+    print(f"standardize inputs: {args.standardize_inputs}")
+
+    if args.standardize_inputs:
+        if feature_mean is None or feature_std is None:
+            raise RuntimeError("표준화 통계가 없습니다.")
+
+        print(
+            "feature standardizer | "
+            f"max_abs_mean={feature_mean.abs().max().item():.3e} | "
+            f"min_std={feature_std.min().item():.3e} | "
+            f"max_std={feature_std.max().item():.3e}"
+        )
     print(
         f"samples | train={len(train_dataset)} | validation={len(validation_dataset)} | "
         f"test={len(test_dataset)}"
@@ -206,7 +330,7 @@ def main() -> None:
         f"alpha={args.alpha} | eta={args.eta} | rho={args.residual_correlation_shrinkage} | "
         f"lambda={args.risk_aversion} | max_weight={args.max_weight}"
     )
-    fit(
+    training_result = fit(
         model=model,
         train_loader=train_loader,
         validation_loader=validation_loader,
@@ -224,6 +348,26 @@ def main() -> None:
         max_validation_batches=args.max_validation_batches,
         max_test_batches=args.max_test_batches,
     )
+
+    if args.make_report:
+        generate_run_report(
+            model=model,
+            test_loader=test_loader,
+            tickers=dataset.tickers,
+            output_dir=output_dir,
+            device=device,
+            metadata=config,
+            best_epoch=training_result.best_epoch,
+            best_validation_loss=(
+                training_result.best_validation_loss
+            ),
+            baseline_run_dir=args.baseline_run_dir,
+            baseline_label=args.baseline_label,
+            active_threshold=args.active_threshold,
+            cap_tolerance=args.cap_tolerance,
+            periods_per_year=252,
+            dpi=args.report_dpi,
+        )
 
 
 if __name__ == "__main__":

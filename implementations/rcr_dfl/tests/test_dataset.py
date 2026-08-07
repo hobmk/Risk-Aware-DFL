@@ -4,7 +4,12 @@ import numpy as np
 import pandas as pd
 import torch
 
-from implementations.rcr_dfl.src.dataset import RCRRollingMVODataset, chronological_split
+from implementations.rcr_dfl.src.dataset import (
+    FeatureStandardizedSubset,
+    RCRRollingMVODataset,
+    chronological_split,
+    fit_feature_standardizer,
+)
 
 
 def _prices_from_returns(returns: np.ndarray, initial: float = 100.0) -> np.ndarray:
@@ -36,7 +41,7 @@ def test_external_market_dataset_generates_residual_correlation(tmp_path: Path) 
         market_column="INDEX",
         lookback=4,
         covariance_jitter=1e-6,
-        residual_correlation_shrinkage=0.1,
+        residual_correlation_shrinkage=0.0,
         correlation_scaling="trace",
     )
     sample = dataset[0]
@@ -78,3 +83,99 @@ def test_chronological_split(tmp_path: Path) -> None:
         validation_end=str(dataset.target_dates[5].date()),
     )
     assert (len(train), len(validation), len(test)) == (3, 3, 2)
+
+
+
+def test_feature_standardization_uses_train_data_only(
+    tmp_path: Path,
+) -> None:
+    asset_csv, market_csv = _write_synthetic_csvs(tmp_path)
+
+    dataset = RCRRollingMVODataset(
+        price_csv=asset_csv,
+        market_mode="external",
+        market_price_csv=market_csv,
+        market_column="INDEX",
+        lookback=4,
+        residual_correlation_shrinkage=0.0,
+        correlation_scaling="trace",
+    )
+
+    train, validation, test = chronological_split(
+        dataset,
+        train_end=str(dataset.target_dates[2].date()),
+        validation_end=str(dataset.target_dates[5].date()),
+    )
+
+    feature_mean, feature_std = fit_feature_standardizer(
+        dataset,
+        train,
+    )
+
+    feature_positions: list[int] = []
+
+    for sample_index in train.indices:
+        target_position = int(
+            dataset.target_positions[int(sample_index)]
+        )
+        feature_positions.extend(
+            range(
+                target_position - dataset.lookback,
+                target_position,
+            )
+        )
+
+    unique_positions = np.unique(
+        np.asarray(feature_positions, dtype=np.int64)
+    )
+    expected_features = dataset.returns[unique_positions]
+
+    expected_mean = torch.tensor(
+        expected_features.mean(axis=0),
+        dtype=dataset.dtype,
+    )
+    expected_std = torch.tensor(
+        expected_features.std(axis=0, ddof=0),
+        dtype=dataset.dtype,
+    )
+
+    assert torch.allclose(feature_mean, expected_mean, atol=1e-12)
+    assert torch.allclose(feature_std, expected_std, atol=1e-12)
+
+    standardized_train = FeatureStandardizedSubset(
+        train,
+        feature_mean,
+        feature_std,
+    )
+
+    raw_sample = train[0]
+    standardized_sample = standardized_train[0]
+
+    assert torch.allclose(
+        standardized_sample["features"],
+        (
+            raw_sample["features"] - feature_mean
+        ) / feature_std,
+        atol=1e-12,
+    )
+
+    for key in (
+        "target",
+        "covariance",
+        "residuals",
+        "residual_correlation_raw",
+        "residual_correlation",
+        "a_res",
+    ):
+        assert torch.allclose(
+            standardized_sample[key],
+            raw_sample[key],
+            atol=1e-12,
+        )
+
+    assert (
+        standardized_sample["target_date"]
+        == raw_sample["target_date"]
+    )
+    assert len(validation) == 3
+    assert len(test) == 2

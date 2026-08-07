@@ -27,7 +27,7 @@ def main() -> None:
     capm = fit_capm(returns, market)
     covariance = covariance_matrix(returns) + 1e-6 * torch.eye(n_assets, dtype=dtype)
     residual_correlation_raw = correlation_matrix(capm.residuals)
-    residual_correlation = shrink_correlation(residual_correlation_raw, shrinkage=0.1)
+    residual_correlation = shrink_correlation(residual_correlation_raw, shrinkage=0.0)
     a_res = scale_correlation_to_covariance(
         residual_correlation,
         reference_covariance=covariance,
@@ -63,3 +63,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
