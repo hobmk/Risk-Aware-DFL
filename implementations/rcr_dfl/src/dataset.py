@@ -12,7 +12,6 @@ from .capm import fit_capm
 from .residual_risk import (
     CorrelationScaling,
     correlation_matrix,
-    covariance_matrix,
     scale_correlation_to_covariance,
     shrink_correlation,
 )
@@ -176,35 +175,91 @@ class RCRRollingMVODataset(Dataset):
         return returns
 
     def _precompute_risk_inputs(self) -> None:
+        # [num_samples, lookback, n_assets]
         asset_windows = np.lib.stride_tricks.sliding_window_view(
-            self.returns, window_shape=self.lookback, axis=0
+            self.returns,
+            window_shape=self.lookback,
+            axis=0,
         ).transpose(0, 2, 1)[:-1]
-        market_windows = np.lib.stride_tricks.sliding_window_view(
-            self.market_returns, window_shape=self.lookback
-        )[:-1]
-        asset_windows_tensor = torch.from_numpy(np.ascontiguousarray(asset_windows)).to(self.dtype)
-        market_windows_tensor = torch.from_numpy(np.ascontiguousarray(market_windows)).to(self.dtype)
 
+        # [num_samples, lookback]
+        market_windows = np.lib.stride_tricks.sliding_window_view(
+            self.market_returns,
+            window_shape=self.lookback,
+        )[:-1]
+
+        # CAPM / residual 계산은 float64 유지
+        asset_windows_risk = torch.from_numpy(
+            np.ascontiguousarray(asset_windows)
+        ).to(torch.float64)
+
+        market_windows_risk = torch.from_numpy(
+            np.ascontiguousarray(market_windows)
+        ).to(torch.float64)
+
+        # Rolling CAPM
         capm = fit_capm(
-            asset_returns=asset_windows_tensor,
-            market_returns=market_windows_tensor,
+            asset_returns=asset_windows_risk,
+            market_returns=market_windows_risk,
             risk_free_rates=self.risk_free_rate,
             fit_intercept=self.fit_intercept,
         )
-        covariance = covariance_matrix(asset_windows_tensor)
-        eye = torch.eye(self.n_assets, dtype=self.dtype).unsqueeze(0)
-        covariance = covariance + self.covariance_jitter * eye
 
-        residual_correlation_raw = correlation_matrix(
-            capm.residuals, eps=self.correlation_eps
+        # --------------------------------------------------------------
+        # 기본 covariance Σ
+        # 기존 DFL-MVO와 동일하게 np.cov(..., ddof=1) 사용
+        # --------------------------------------------------------------
+        covariance_np = np.stack(
+            [
+                np.cov(
+                    window,
+                    rowvar=False,
+                    ddof=1,
+                )
+                for window in asset_windows
+            ],
+            axis=0,
         )
+
+        # 수치 오차에 의한 비대칭 제거
+        covariance_np = 0.5 * (
+            covariance_np
+            + np.transpose(covariance_np, (0, 2, 1))
+        )
+
+        # diagonal jitter
+        covariance_np = covariance_np + (
+            self.covariance_jitter
+            * np.eye(
+                self.n_assets,
+                dtype=np.float64,
+            )[None, :, :]
+        )
+
+        # DFL-MVO Dataset과 동일한 dtype 사용
+        covariance = torch.from_numpy(
+            covariance_np
+        ).to(self.dtype)
+
+        # --------------------------------------------------------------
+        # CAPM residual correlation
+        # --------------------------------------------------------------
+        residual_correlation_raw = correlation_matrix(
+            capm.residuals,
+            eps=self.correlation_eps,
+        )
+
         residual_correlation = shrink_correlation(
             residual_correlation_raw,
             shrinkage=self.residual_correlation_shrinkage,
         )
+
+        # --------------------------------------------------------------
+        # Residual correlation -> covariance scale A_res
+        # --------------------------------------------------------------
         a_res = scale_correlation_to_covariance(
             correlation=residual_correlation,
-            reference_covariance=covariance,
+            reference_covariance=covariance.to(torch.float64),
             scaling=self.correlation_scaling,
         )
 
