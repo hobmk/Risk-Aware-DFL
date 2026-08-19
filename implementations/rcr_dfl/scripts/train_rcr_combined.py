@@ -179,7 +179,7 @@ def main() -> None:
         fit_intercept=not args.no_capm_intercept,
         residual_correlation_shrinkage=args.residual_correlation_shrinkage,
         correlation_scaling=args.correlation_scaling,
-        dtype=torch.float64,
+        dtype=torch.float32,
     )
     train_subset, validation_subset, test_subset = chronological_split(
         dataset=dataset,
@@ -250,7 +250,8 @@ def main() -> None:
         effective_jitter=args.effective_jitter,
         project_psd=args.project_psd,
         minimum_eigenvalue=args.minimum_eigenvalue,
-    ).float()
+    ).float().to(device)
+
     optimizer = torch.optim.AdamW(
         model.return_model.parameters(),
         lr=args.learning_rate,
