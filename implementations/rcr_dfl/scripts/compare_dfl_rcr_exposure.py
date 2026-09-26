@@ -293,6 +293,131 @@ def hac_mean_test(
         "hac_p": p_value,
     }
 
+def hac_indicator_regression_test(
+    y: np.ndarray,
+    indicator: np.ndarray,
+    max_lag: int,
+) -> dict[str, float]:
+    y = np.asarray(y, dtype=np.float64)
+    indicator = np.asarray(indicator, dtype=np.float64)
+
+    valid = np.isfinite(y) & np.isfinite(indicator)
+    y = y[valid]
+    indicator = indicator[valid]
+
+    n = len(y)
+
+    if n < 3 or np.unique(indicator).size < 2:
+        return {
+            "difference": np.nan,
+            "hac_se": np.nan,
+            "hac_t": np.nan,
+            "hac_p": np.nan,
+        }
+
+    x = np.column_stack([
+        np.ones(n, dtype=np.float64),
+        indicator,
+    ])
+
+    xtx_inv = np.linalg.inv(x.T @ x)
+    
+    beta = xtx_inv @ x.T @ y
+    residuals = y - x @ beta
+
+    scores = x * residuals[:, None]
+    long_run = scores.T @ scores
+
+    lag_max = min(max_lag, n - 1)
+
+    for lag in range(1, lag_max + 1):
+        weight = 1.0 - lag / (lag_max + 1.0)
+        gamma = scores[lag:].T @ scores[:-lag]
+        long_run += weight * (gamma + gamma.T)
+
+    covariance = xtx_inv @ long_run @ xtx_inv
+    se = float(np.sqrt(max(covariance[1, 1], 0.0)))
+
+    coefficient = float(beta[1])
+    t_value = coefficient / se if se > 0 else np.nan
+    p_value = (
+        float(2.0 * norm.sf(abs(t_value)))
+        if np.isfinite(t_value)
+        else np.nan
+    )
+
+    return {
+        "difference": coefficient,
+        "hac_se": se,
+        "hac_t": t_value,
+        "hac_p": p_value,
+    }
+
+def build_high_exposure_significance_tests(
+    frame: pd.DataFrame,
+    horizon: int,
+) -> pd.DataFrame:
+    sample = frame.dropna(
+        subset=[
+            "dfl_ares_positive_offdiag",
+            "dfl_future_variance",
+            "dfl_future_volatility",
+            "dfl_future_mdd",
+        ]
+    ).copy()
+
+    threshold = float(
+        sample["dfl_ares_positive_offdiag"].quantile(0.75)
+    )
+
+    sample["high_q4"] = (
+        sample["dfl_ares_positive_offdiag"] >= threshold
+    ).astype(float)
+
+    rows = []
+
+    for metric in [
+        "future_variance",
+        "future_volatility",
+        "future_mdd",
+    ]:
+        column = f"dfl_{metric}"
+
+        q4 = sample.loc[
+            sample["high_q4"] == 1,
+            column,
+        ]
+        other = sample.loc[
+            sample["high_q4"] == 0,
+            column,
+        ]
+
+        test = hac_indicator_regression_test(
+            y=sample[column].to_numpy(),
+            indicator=sample["high_q4"].to_numpy(),
+            max_lag=horizon - 1,
+        )
+
+        rows.append({
+            "metric": metric,
+            "q4_n": len(q4),
+            "q1_q3_n": len(other),
+            "q4_mean": float(q4.mean()),
+            "q1_q3_mean": float(other.mean()),
+            "q4_minus_q1_q3": (
+                float(q4.mean() - other.mean())
+            ),
+            "relative_difference_pct": (
+                float(
+                    (q4.mean() / other.mean() - 1.0)
+                    * 100.0
+                )
+            ),
+            "hac_lags": horizon - 1,
+            **test,
+        })
+
+    return pd.DataFrame(rows)
 
 def build_comparison(
     dataset: RCRRollingMVODataset,
@@ -794,19 +919,18 @@ def build_high_exposure_summary(
                         ].mean()
                     ),
 
-                "positive_ares_reduction_pct":
+                "positive_ares_reduction_pct": (
                     float(
                         (
                             1.0
-                            - data[
-                                "rcr_ares_positive_offdiag"
-                            ].mean()
-                            / data[
-                                "dfl_ares_positive_offdiag"
-                            ].mean()
+                            - data["rcr_ares_positive_offdiag"].mean()
+                            / data["dfl_ares_positive_offdiag"].mean()
                         )
                         * 100.0
-                    ),
+                    )
+                    if abs(data["dfl_ares_positive_offdiag"].mean()) > 1e-12
+                    else np.nan
+                ),
 
                 "dfl_future_vol":
                     float(
@@ -996,6 +1120,13 @@ def main() -> None:
         )
     )
 
+    high_exposure_tests = (
+        build_high_exposure_significance_tests(
+            frame,
+            horizon=args.horizon,
+        )
+    )
+
     correlations = (
         delta_correlations(
             frame
@@ -1030,6 +1161,12 @@ def main() -> None:
         encoding="utf-8-sig",
     )
 
+    high_exposure_tests.to_csv(
+        output_dir / "high_exposure_significance_tests.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    
     correlations.to_csv(
         output_dir
         / "delta_exposure_future_risk_correlations.csv",
@@ -1253,6 +1390,21 @@ def main() -> None:
     )
 
     print(
+    "\n" + "=" * 110
+    )
+    print(
+        "HIGH EXPOSURE Q4 vs Q1-Q3 HAC SIGNIFICANCE"
+    )
+    print(
+        "=" * 110
+    )
+    print(
+        high_exposure_tests
+        .round(8)
+        .to_string(index=False)
+    )
+
+    print(
         "\n" + "=" * 110
     )
     print(
@@ -1278,6 +1430,7 @@ def main() -> None:
         "paired_hac_tests.csv",
         "high_exposure_regime_summary.csv",
         "delta_exposure_future_risk_correlations.csv",
+        "high_exposure_significance_tests.csv",
     ]:
         print(
             output_dir / filename
