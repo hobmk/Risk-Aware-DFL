@@ -14,6 +14,27 @@ from .decision_model import RCRMLPWithMarkowitz
 from .losses import markowitz_cost
 
 
+def calculate_one_way_turnover(
+    target_weights: torch.Tensor,
+    previous_target_weights: torch.Tensor | None,
+    previous_asset_returns: torch.Tensor | None,
+) -> float:
+    """Drift-adjusted one-way turnover: 0.5 * ||w_t - w_t_pre||_1."""
+    if previous_target_weights is None or previous_asset_returns is None:
+        return 0.0
+
+    gross_positions = previous_target_weights * (1.0 + previous_asset_returns)
+    portfolio_gross = gross_positions.sum()
+
+    if not torch.isfinite(portfolio_gross).item() or portfolio_gross.item() <= 0.0:
+        raise ValueError("이전 포트폴리오의 gross value가 유효하지 않습니다.")
+
+    pretrade_weights = gross_positions / portfolio_gross
+
+    return 0.5 * torch.abs(
+        target_weights - pretrade_weights
+    ).sum().item()
+
 def calculate_portfolio_metrics(
     portfolio_returns: torch.Tensor,
     periods_per_year: int = 252,
@@ -99,6 +120,7 @@ def evaluate_test_portfolio(
     equal_weight_returns: list[float] = []
 
     previous_weight: torch.Tensor | None = None
+    previous_asset_returns: torch.Tensor | None = None
     max_weight = float(model.max_weight)
 
     with torch.no_grad():
@@ -182,14 +204,16 @@ def evaluate_test_portfolio(
 
             for sample_index, date in enumerate(dates):
                 weight = predicted_weights[sample_index]
+                asset_returns = true_returns[sample_index]
 
-                turnover = (
-                    0.0
-                    if previous_weight is None
-                    else 0.5
-                    * torch.abs(weight - previous_weight).sum().item()
+                turnover = calculate_one_way_turnover(
+                    target_weights=weight,
+                    previous_target_weights=previous_weight,
+                    previous_asset_returns=previous_asset_returns,
                 )
+
                 previous_weight = weight.clone()
+                previous_asset_returns = asset_returns.clone()
 
                 active_mask = weight > active_threshold
                 capped_mask = (
@@ -485,6 +509,8 @@ def build_comparison(
             "average_active_assets": float("nan"),
             "average_capped_assets": float("nan"),
             "average_daily_turnover": float("nan"),
+            "annualized_turnover": float("nan"),
+            "total_turnover": float("nan"),
             "average_effective_assets": float("nan"),
         }
 
@@ -503,6 +529,12 @@ def build_comparison(
                     ),
                     "average_daily_turnover": float(
                         comparison["turnover"].mean()
+                    ),
+                    "annualized_turnover": float(
+                        comparison["turnover"].mean() * periods_per_year
+                    ),
+                    "total_turnover": float(
+                        comparison["turnover"].sum()
                     ),
                     "average_effective_assets": float(
                         comparison[
@@ -941,14 +973,17 @@ def generate_run_report(
     )
 
     display_columns = [
-        "strategy",
-        "annualized_return_cagr",
-        "annualized_volatility",
-        "sharpe_ratio",
-        "maximum_drawdown",
-        "final_wealth",
-        "average_active_assets",
-    ]
+    "strategy",
+    "annualized_return_cagr",
+    "annualized_volatility",
+    "sharpe_ratio",
+    "maximum_drawdown",
+    "final_wealth",
+    "average_active_assets",
+    "average_daily_turnover",
+    "annualized_turnover",
+    "total_turnover"
+]
 
     print()
     print("=" * 100)
