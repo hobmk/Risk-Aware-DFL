@@ -55,6 +55,7 @@ def run_epoch(
     alpha: float,
     mse_scale: float,
     optimizer: torch.optim.Optimizer | None = None,
+    oracle_weights_cache: torch.Tensor | None = None,
     gradient_clip_norm: float | None = None,
     max_batches: int | None = None,
 ) -> EpochMetrics:
@@ -79,6 +80,13 @@ def run_epoch(
             and batch_index >= max_batches
         ):
             break
+
+        sample_indices = batch[
+            "sample_index"
+        ].to(
+            device="cpu",
+            dtype=torch.long,
+        )
 
         features = batch["features"].to(
             device=device,
@@ -112,10 +120,18 @@ def run_epoch(
                 eigen_risk=eigen_risk,
             )
 
-            oracle_weights = model.solve_oracle(
-                true_returns=targets,
-                risk_factor=output.risk_factor,
-            )
+            if oracle_weights_cache is None:
+                oracle_weights = model.solve_oracle(
+                    true_returns=targets,
+                    risk_factor=output.risk_factor,
+                )
+            else:
+                oracle_weights = (
+                    oracle_weights_cache.index_select(
+                        0,
+                        sample_indices,
+                    )
+                )
 
             losses = compute_losses(
                 predicted_returns=output.predicted_returns,
@@ -229,6 +245,7 @@ def fit(
     alpha: float,
     mse_scale: float,
     output_dir: str | Path,
+    oracle_weights_cache: torch.Tensor | None = None,
     gradient_clip_norm: float | None = None,
     max_train_batches: int | None = None,
     max_validation_batches: int | None = None,
@@ -252,6 +269,12 @@ def fit(
 
     model.to(device)
 
+    if oracle_weights_cache is not None:
+        oracle_weights_cache = oracle_weights_cache.to(
+            device="cpu",
+            dtype=torch.float64,
+        )
+
     best_epoch = 0
     best_validation_loss = float("inf")
     no_improvement = 0
@@ -266,6 +289,7 @@ def fit(
             alpha,
             mse_scale,
             optimizer=optimizer,
+            oracle_weights_cache=oracle_weights_cache,
             gradient_clip_norm=gradient_clip_norm,
             max_batches=max_train_batches,
         )
@@ -276,6 +300,7 @@ def fit(
             device,
             alpha,
             mse_scale,
+            oracle_weights_cache=oracle_weights_cache,
             max_batches=max_validation_batches,
         )
 
@@ -358,6 +383,7 @@ def fit(
         device,
         alpha,
         mse_scale,
+        oracle_weights_cache=oracle_weights_cache,
         max_batches=max_test_batches,
     )
 
