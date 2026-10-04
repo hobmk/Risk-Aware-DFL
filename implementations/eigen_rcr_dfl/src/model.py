@@ -102,16 +102,11 @@ class EigenRCRDFL(nn.Module):
         self.eta = eta
         self.effective_jitter = effective_jitter
 
-    def forward(
+    def build_risk_factor(
         self,
-        features: torch.Tensor,
         covariance: torch.Tensor,
         eigen_risk: torch.Tensor,
-    ) -> EigenRCRForwardOutput:
-        predicted_returns = self.return_model(
-            features
-        )
-
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         covariance = covariance.to(
             device="cpu",
             dtype=torch.float64,
@@ -137,6 +132,28 @@ class EigenRCRDFL(nn.Module):
             covariance=effective_covariance,
             risk_aversion=self.risk_aversion,
             jitter=self.effective_jitter,
+        )
+
+        return (
+            effective_covariance,
+            risk_factor,
+        )
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        covariance: torch.Tensor,
+        eigen_risk: torch.Tensor,
+    ) -> EigenRCRForwardOutput:
+        predicted_returns = self.return_model(
+            features
+        )
+
+        effective_covariance, risk_factor = (
+            self.build_risk_factor(
+                covariance=covariance,
+                eigen_risk=eigen_risk,
+            )
         )
 
         predicted_returns_solver = predicted_returns.to(

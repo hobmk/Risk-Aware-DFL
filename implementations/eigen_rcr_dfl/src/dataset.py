@@ -252,7 +252,7 @@ class EigenRCRDataset(Dataset):
     def __getitem__(
         self,
         index: int,
-    ) -> dict[str, torch.Tensor | str]:
+    ) -> dict[str, torch.Tensor | str | int]:
         target_position = int(self.target_positions[index])
         start = target_position - self.lookback
 
@@ -269,6 +269,7 @@ class EigenRCRDataset(Dataset):
         target_date = self.return_dates[target_position]
 
         return {
+            "sample_index": index,
             "features": features,
             "target": target,
             "covariance": self.covariances[index],
@@ -280,6 +281,7 @@ class EigenRCRDataset(Dataset):
             "retained_ratio": self.retained_ratio[index],
             "target_date": target_date.strftime("%Y-%m-%d"),
         }
+            
 
     @property
     def target_dates(self) -> pd.DatetimeIndex:
