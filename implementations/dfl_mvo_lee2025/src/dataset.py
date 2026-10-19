@@ -7,7 +7,9 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, Subset
-
+from .cache import (
+    load_or_build_covariance_cache,
+)
 
 ReturnType = Literal["simple", "log"]
 
@@ -41,6 +43,8 @@ class RollingMVODataset(Dataset):
         return_type: ReturnType = "simple",
         covariance_jitter: float = 1e-6,
         dtype: torch.dtype = torch.float64,
+        risk_cache_dir: str | Path | None = None,
+        force_rebuild_risk_cache: bool = False,
     ) -> None:
         super().__init__()
 
@@ -61,6 +65,19 @@ class RollingMVODataset(Dataset):
         self.return_type = return_type
         self.covariance_jitter = covariance_jitter
         self.dtype = dtype
+
+        self.risk_cache_dir = (
+            risk_cache_dir
+        )
+
+        self.force_rebuild_risk_cache = bool(
+            force_rebuild_risk_cache
+        )
+
+        self.risk_cache_hit = False
+        self.risk_cache_key = None
+        self.risk_cache_path = None
+        self.covariances = None
 
         prices = self._load_prices()
         returns = self._calculate_returns(prices)
@@ -89,6 +106,41 @@ class RollingMVODataset(Dataset):
             len(returns),
             dtype=np.int64,
         )
+
+        if self.risk_cache_dir is not None:
+            (
+                self.covariances,
+                cache_path,
+                cache_hit,
+                cache_key,
+            ) = (
+                load_or_build_covariance_cache(
+                    returns=self.returns,
+                    lookback=self.lookback,
+                    covariance_jitter=(
+                        self.covariance_jitter
+                    ),
+                    dtype=self.dtype,
+                    cache_dir=(
+                        self.risk_cache_dir
+                    ),
+                    force_rebuild=(
+                        self.force_rebuild_risk_cache
+                    ),
+                )
+            )
+
+            self.risk_cache_hit = (
+                cache_hit
+            )
+
+            self.risk_cache_key = (
+                cache_key
+            )
+
+            self.risk_cache_path = str(
+                cache_path
+            )
 
     def _load_prices(self) -> pd.DataFrame:
         if not self.price_csv.exists():
@@ -189,22 +241,38 @@ class RollingMVODataset(Dataset):
         # 바로 다음 거래일 수익률
         target_return = self.returns[target_position]
 
-        covariance = np.cov(
-            feature_window,
-            rowvar=False,
-            ddof=1,
-        )
+        if self.covariances is not None:
+            covariance_tensor = (
+                self.covariances[index]
+            )
 
-        # 수치오차로 인한 비대칭 제거
-        covariance = 0.5 * (
-            covariance + covariance.T
-        )
+        else:
+            covariance = np.cov(
+                feature_window,
+                rowvar=False,
+                ddof=1,
+            )
 
-        # Cholesky 분해와 convex solver 안정화를 위한 diagonal jitter
-        covariance = covariance + (
-            self.covariance_jitter
-            * np.eye(self.n_assets, dtype=np.float64)
-        )
+            covariance = 0.5 * (
+                covariance
+                + covariance.T
+            )
+
+            covariance = (
+                covariance
+                + self.covariance_jitter
+                * np.eye(
+                    self.n_assets,
+                    dtype=np.float64,
+                )
+            )
+
+            covariance_tensor = (
+                torch.tensor(
+                    covariance,
+                    dtype=self.dtype,
+                )
+            )
 
         target_date = self.return_dates[target_position]
 
@@ -217,10 +285,7 @@ class RollingMVODataset(Dataset):
                 target_return,
                 dtype=self.dtype,
             ),
-            "covariance": torch.tensor(
-                covariance,
-                dtype=self.dtype,
-            ),
+            "covariance": covariance_tensor,
             "target_date": target_date.strftime("%Y-%m-%d"),
         }
 
@@ -352,3 +417,70 @@ def fit_feature_standardizer(
         torch.tensor(feature_mean, dtype=dataset.dtype),
         torch.tensor(feature_std, dtype=dataset.dtype),
     )
+
+class OracleWeightSubset(Dataset):
+    """
+    Dataset sample에 미리 계산한
+    oracle portfolio weight를 붙인다.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        oracle_weights: torch.Tensor,
+        global_indices: list[int],
+    ) -> None:
+
+        self.dataset = dataset
+
+        self.oracle_weights = (
+            oracle_weights
+        )
+
+        self.global_indices = [
+            int(i)
+            for i in global_indices
+        ]
+
+        if (
+            len(self.dataset)
+            != len(self.global_indices)
+        ):
+            raise ValueError(
+                "dataset 길이와 "
+                "global_indices 길이가 "
+                "다릅니다."
+            )
+
+    def __len__(self) -> int:
+        return len(
+            self.dataset
+        )
+
+    def __getitem__(
+        self,
+        index: int,
+    ) -> dict[
+        str,
+        torch.Tensor | str,
+    ]:
+
+        sample = dict(
+            self.dataset[index]
+        )
+
+        global_index = (
+            self.global_indices[
+                index
+            ]
+        )
+
+        sample[
+            "oracle_weight"
+        ] = (
+            self.oracle_weights[
+                global_index
+            ]
+        )
+
+        return sample

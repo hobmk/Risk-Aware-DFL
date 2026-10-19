@@ -20,13 +20,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-
 from implementations.dfl_mvo_lee2025.src.dataset import (
     FeatureStandardizedSubset,
+    OracleWeightSubset,
     RollingMVODataset,
     chronological_split,
     fit_feature_standardizer,
 )
+
+from implementations.dfl_mvo_lee2025.src.cache import (
+    load_or_build_oracle_cache,
+)
+
 from implementations.dfl_mvo_lee2025.src.losses import (
     combined_loss,
     markowitz_cost,
@@ -153,6 +158,48 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="기존 실험 폴더를 삭제하고 다시 실행합니다.",
     )
+    parser.add_argument(
+        "--device",
+        choices=[
+            "auto",
+            "cpu",
+            "cuda",
+        ],
+        default="auto",
+    )
+
+    parser.add_argument(
+        "--risk-cache-dir",
+        default=(
+            "implementations/"
+            "dfl_mvo_lee2025/"
+            "cache/risk_matrix"
+        ),
+    )
+
+    parser.add_argument(
+        "--force-rebuild-risk-cache",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--oracle-cache-dir",
+        default=(
+            "implementations/"
+            "dfl_mvo_lee2025/"
+            "cache/oracle"
+        ),
+    )
+
+    parser.add_argument(
+        "--force-rebuild-oracle-cache",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+    )
 
     return parser.parse_args()
 
@@ -177,6 +224,28 @@ def save_json(path: Path, payload: dict) -> None:
             allow_nan=True,
         )
 
+def resolve_device(name: str,) -> torch.device:
+
+    if name == "cpu":
+        return torch.device(
+            "cpu"
+        )
+
+    if name == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA를 사용할 수 없습니다."
+            )
+
+        return torch.device(
+            "cuda"
+        )
+
+    return torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
 
 class MLPWithMarkowitz(nn.Module):
     def __init__(
@@ -251,6 +320,7 @@ def compute_losses(
     covariance: torch.Tensor,
     alpha: float,
     mse_scale: float,
+    oracle_weights: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -272,11 +342,25 @@ def compute_losses(
         dtype=torch.float64,
     )
 
-    oracle_weights, = model.markowitz_layer(
-        true_returns_solver,
-        risk_factor,
-    )
-    oracle_weights = oracle_weights.detach()
+    if oracle_weights is None:
+        oracle_weights, = (
+            model.markowitz_layer(
+                true_returns_solver,
+                risk_factor,
+            )
+        )
+
+        oracle_weights = (
+            oracle_weights.detach()
+        )
+
+    else:
+        oracle_weights = (
+            oracle_weights.to(
+                device="cpu",
+                dtype=torch.float64,
+            )
+        )
 
     regret = mvo_regret(
         predicted_weights=predicted_weights,
@@ -478,6 +562,9 @@ def run_epoch(
         features = batch["features"].to(device)
         targets = batch["target"].to(device)
         covariance = batch["covariance"]
+        oracle_weights = batch.get(
+            "oracle_weight"
+        )
 
         if is_training:
             optimizer.zero_grad(set_to_none=True)
@@ -496,6 +583,7 @@ def run_epoch(
                 covariance=covariance,
                 alpha=alpha,
                 mse_scale=mse_scale,
+                oracle_weights=oracle_weights,
             )
 
             if is_training:
@@ -737,11 +825,12 @@ def evaluate_and_save_test_results(
                 .to(device="cpu", dtype=torch.float64)
             )
 
-            oracle_weights, = model.markowitz_layer(
-                true_returns_cpu,
-                risk_factor,
+            oracle_weights = (
+                batch["oracle_weight"].to(
+                    device="cpu",
+                    dtype=torch.float64,
+                )
             )
-            oracle_weights = oracle_weights.detach()
 
             regret_per_sample = mvo_regret(
                 predicted_weights=predicted_weights,
@@ -1045,6 +1134,14 @@ def main() -> None:
         return_type="simple",
         covariance_jitter=1e-6,
         dtype=torch.float32,
+
+        risk_cache_dir=(
+            args.risk_cache_dir
+        ),
+
+        force_rebuild_risk_cache=(
+            args.force_rebuild_risk_cache
+        ),
     )
 
     train_set, validation_set, test_set = chronological_split(
@@ -1052,6 +1149,21 @@ def main() -> None:
         train_end=args.train_end,
         validation_end=args.validation_end,
     )
+    train_indices = [
+        int(i)
+        for i in train_set.indices
+    ]
+
+    validation_indices = [
+        int(i)
+        for i in validation_set.indices
+    ]
+
+    test_indices = [
+        int(i)
+        for i in test_set.indices
+    ]
+
     feature_mean = None
     feature_std = None
 
@@ -1077,8 +1189,51 @@ def main() -> None:
             feature_std=feature_std,
         )
 
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
+    (
+        oracle_weights_cache,
+        oracle_cache_path,
+        oracle_cache_hit,
+    ) = load_or_build_oracle_cache(
+        dataset=dataset,
+        risk_aversion=(
+            args.risk_aversion
+        ),
+        max_weight=(
+            args.max_weight
+        ),
+        batch_size=(
+            args.batch_size
+        ),
+        cache_dir=(
+            args.oracle_cache_dir
+        ),
+        force_rebuild=(
+            args.force_rebuild_oracle_cache
+        ),
+    )
+
+    train_set = OracleWeightSubset(
+        train_set,
+        oracle_weights_cache,
+        train_indices,
+    )
+
+    validation_set = (
+        OracleWeightSubset(
+            validation_set,
+            oracle_weights_cache,
+            validation_indices,
+        )
+    )
+
+    test_set = OracleWeightSubset(
+        test_set,
+        oracle_weights_cache,
+        test_indices,
+    )
+
+    device = resolve_device(
+        args.device
     )
 
     train_generator = torch.Generator()
@@ -1134,18 +1289,35 @@ def main() -> None:
     )
 
     output_dir = (
-        PROJECT_ROOT
-        / "implementations"
-        / "dfl_mvo_lee2025"
-        / "outputs"
-        / "combined"
-        / dataset_name
-        / experiment_name
-        / f"alpha_{args.alpha:.2f}"
-        / f"lambda_{args.risk_aversion:.2f}"
-        / f"maxw_{args.max_weight:.2f}"
-        / f"seed_{args.seed}"
+        Path(args.output_dir)
+        if args.output_dir
+        else (
+            PROJECT_ROOT
+            / "implementations"
+            / "dfl_mvo_lee2025"
+            / "outputs"
+            / "combined"
+            / dataset_name
+            / experiment_name
+            / f"alpha_{args.alpha:.2f}"
+            / f"lambda_{args.risk_aversion:.2f}"
+            / f"maxw_{args.max_weight:.2f}"
+            / f"seed_{args.seed}"
+        )
     )
+
+    completed_file = (
+        output_dir
+        / "summary.json"
+    )
+
+    if completed_file.exists():
+        print(
+            "SKIP | completed run "
+            "already exists: "
+            f"{output_dir}"
+        )
+        return
 
     if output_dir.exists() and any(output_dir.iterdir()):
         if not args.overwrite:
@@ -1189,6 +1361,26 @@ def main() -> None:
                 else None
             ),
         },
+        "risk_cache": {
+            "hit": bool(
+                dataset.risk_cache_hit
+            ),
+            "key": (
+                dataset.risk_cache_key
+            ),
+            "path": (
+                dataset.risk_cache_path
+            ),
+        },
+
+        "oracle_cache": {
+            "hit": bool(
+                oracle_cache_hit
+            ),
+            "path": str(
+                oracle_cache_path
+            ),
+        },
         "environment": {
             "python": platform.python_version(),
             "torch": str(torch.__version__),
@@ -1226,6 +1418,25 @@ def main() -> None:
     print("Maximum weight:", args.max_weight)
     print("Active threshold:", args.active_threshold)
     print("Seed:", args.seed)
+    print(
+        "Risk cache:",
+        (
+            "HIT"
+            if dataset.risk_cache_hit
+            else "BUILD"
+        ),
+        dataset.risk_cache_path,
+    )
+
+    print(
+        "Oracle cache:",
+        (
+            "HIT"
+            if oracle_cache_hit
+            else "BUILD"
+        ),
+        oracle_cache_path,
+    )
     print("Train samples:", len(train_set))
     print("Validation samples:", len(validation_set))
     print("Test samples:", len(test_set))

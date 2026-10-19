@@ -15,7 +15,14 @@ from implementations.eigen_rcr_dfl.src.dataset import (
     EigenRCRDataset,
     chronological_split,
 )
+from implementations.dfl_mvo_lee2025.src.dataset import (
+    FeatureStandardizedSubset,
+    fit_feature_standardizer,
+)
 from implementations.eigen_rcr_dfl.src.model import EigenRCRDFL
+from implementations.eigen_rcr_dfl.src.oracle_cache import (
+    load_or_build_oracle_cache,
+)
 from implementations.eigen_rcr_dfl.src.trainer import fit
 from implementations.eigen_rcr_dfl.src.backtest import evaluate_portfolio
 
@@ -25,58 +32,184 @@ def parse_args():
         description="Eigenmode RCR-DFL"
     )
 
-    parser.add_argument("--price-csv", default="data/raw/dow30_adjusted_close.csv")
+    parser.add_argument(
+        "--price-csv",
+        default="data/raw/dow30_adjusted_close.csv",
+    )
     parser.add_argument("--date-column", default="Date")
-    parser.add_argument("--return-type", choices=["simple", "log"], default="simple")
+    parser.add_argument(
+        "--return-type",
+        choices=["simple", "log"],
+        default="simple",
+    )
     parser.add_argument("--lookback", type=int, default=60)
 
-    parser.add_argument("--market-mode", choices=["equal_weight", "external"], default="equal_weight")
+    parser.add_argument(
+        "--market-mode",
+        choices=["equal_weight", "external"],
+        default="equal_weight",
+    )
     parser.add_argument("--market-price-csv", default=None)
     parser.add_argument("--market-column", default=None)
     parser.add_argument("--risk-free-rate", type=float, default=0.0)
-    parser.add_argument("--no-capm-intercept", action="store_true")
+    parser.add_argument(
+        "--no-capm-intercept",
+        action="store_true",
+    )
 
     parser.add_argument("--eigen-k", type=int, default=5)
     parser.add_argument(
         "--scale-mode",
-        choices=["none", "preserve_residual_trace", "match_base_trace"],
+        choices=[
+            "none",
+            "preserve_residual_trace",
+            "match_base_trace",
+        ],
         default="none",
     )
 
-    parser.add_argument("--covariance-jitter", type=float, default=1e-6)
-    parser.add_argument("--effective-jitter", type=float, default=0.0)
+    parser.add_argument(
+        "--covariance-jitter",
+        type=float,
+        default=1e-6,
+    )
+    parser.add_argument(
+        "--effective-jitter",
+        type=float,
+        default=0.0,
+    )
 
-    parser.add_argument("--train-end", default="2021-12-31")
-    parser.add_argument("--validation-end", default="2022-12-31")
+    parser.add_argument(
+        "--train-end",
+        default="2021-12-31",
+    )
+    parser.add_argument(
+        "--validation-end",
+        default="2022-12-31",
+    )
 
-    parser.add_argument("--hidden-dim", type=int, default=64)
-    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=64,
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+    )
 
-    parser.add_argument("--risk-aversion", type=float, default=1.0)
-    parser.add_argument("--max-weight", type=float, default=0.2)
-    parser.add_argument("--eta", type=float, default=0.5)
+    parser.add_argument(
+        "--risk-aversion",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--max-weight",
+        type=float,
+        default=0.2,
+    )
+    parser.add_argument(
+        "--eta",
+        type=float,
+        default=0.5,
+    )
 
-    parser.add_argument("--alpha", type=float, default=0.5)
-    parser.add_argument("--mse-scale", type=float, default=30.0)
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--mse-scale",
+        type=float,
+        default=30.0,
+    )
 
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=1e-4,
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.01,
+    )
 
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=200,
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=20,
+    )
 
-    parser.add_argument("--gradient-clip-norm", type=float, default=None)
+    parser.add_argument(
+        "--gradient-clip-norm",
+        type=float,
+        default=None,
+    )
 
-    parser.add_argument("--max-train-batches", type=int, default=None)
-    parser.add_argument("--max-validation-batches", type=int, default=None)
-    parser.add_argument("--max-test-batches", type=int, default=None)
+    parser.add_argument(
+        "--max-train-batches",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--max-validation-batches",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--max-test-batches",
+        type=int,
+        default=None,
+    )
 
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+    )
 
-    parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--overwrite", action="store_true")
+    # ---------------------------------------------------------
+    # Oracle cache
+    # ---------------------------------------------------------
+    parser.add_argument(
+        "--oracle-cache-dir",
+        default=(
+            "implementations/"
+            "eigen_rcr_dfl/"
+            "cache/oracle"
+        ),
+    )
+    parser.add_argument(
+        "--force-rebuild-oracle-cache",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+    )
 
     return parser.parse_args()
 
@@ -101,7 +234,10 @@ def resolve_device(name: str):
 
     if name == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA를 사용할 수 없습니다.")
+            raise RuntimeError(
+                "CUDA를 사용할 수 없습니다."
+            )
+
         return torch.device("cuda")
 
     return torch.device(
@@ -136,10 +272,36 @@ def main():
         )
     )
 
+    # ---------------------------------------------------------
+    # Completed run 자동 SKIP
+    # ---------------------------------------------------------
+    #
+    # 기존 결과 디렉토리와 파일명은 변경하지 않는다.
+    #
+    # portfolio_summary.csv가 존재하면
+    # backtest까지 완료된 run으로 판단하고 그대로 보존한다.
+    #
+    # --overwrite가 전달되더라도 완료 run은 삭제하지 않는다.
+    # ---------------------------------------------------------
+
+    completed_file = (
+        output_dir
+        / "portfolio_summary.csv"
+    )
+
+    if completed_file.exists():
+        print(
+            f"SKIP | completed run already exists: "
+            f"{output_dir}"
+        )
+        return
+
     if output_dir.exists():
         if not args.overwrite:
             raise FileExistsError(
-                f"이미 존재합니다: {output_dir}"
+                f"미완료 output directory가 이미 존재합니다: "
+                f"{output_dir}\n"
+                f"다시 실행하려면 --overwrite를 사용하세요."
             )
 
         shutil.rmtree(
@@ -151,7 +313,13 @@ def main():
         exist_ok=False,
     )
 
-    print(f"Device: {device}")
+    print(
+        f"Device: {device}"
+    )
+
+    # ---------------------------------------------------------
+    # Dataset
+    # ---------------------------------------------------------
 
     dataset = EigenRCRDataset(
         price_csv=args.price_csv,
@@ -177,12 +345,63 @@ def main():
         )
     )
 
-    print(f"N assets: {dataset.n_assets}")
-    print(f"Train: {len(train_dataset)}")
-    print(f"Validation: {len(validation_dataset)}")
-    print(f"Test: {len(test_dataset)}")
+    # ---------------------------------------------------------
+    # Input standardization
+    # ---------------------------------------------------------
 
-    retained = dataset.retained_ratio
+    feature_mean, feature_std = (
+        fit_feature_standardizer(
+            dataset=dataset,
+            train_subset=train_dataset,
+        )
+    )
+
+    train_dataset = FeatureStandardizedSubset(
+        train_dataset,
+        feature_mean,
+        feature_std,
+    )
+
+    validation_dataset = FeatureStandardizedSubset(
+        validation_dataset,
+        feature_mean,
+        feature_std,
+    )
+
+    test_dataset = FeatureStandardizedSubset(
+        test_dataset,
+        feature_mean,
+        feature_std,
+    )
+
+    torch.save(
+        {
+            "feature_mean": feature_mean,
+            "feature_std": feature_std,
+        },
+        output_dir
+        / "feature_standardizer.pt",
+    )
+
+    print(
+        "Input standardization: ON"
+    )
+    print(
+        f"N assets: {dataset.n_assets}"
+    )
+    print(
+        f"Train: {len(train_dataset)}"
+    )
+    print(
+        f"Validation: {len(validation_dataset)}"
+    )
+    print(
+        f"Test: {len(test_dataset)}"
+    )
+
+    retained = (
+        dataset.retained_ratio
+    )
 
     print(
         f"Mean retained residual variance "
@@ -190,8 +409,14 @@ def main():
         f"{retained.mean().item():.4f}"
     )
 
+    # ---------------------------------------------------------
+    # DataLoader
+    # ---------------------------------------------------------
+
     generator = torch.Generator()
-    generator.manual_seed(args.seed)
+    generator.manual_seed(
+        args.seed
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -215,6 +440,10 @@ def main():
         num_workers=0,
     )
 
+    # ---------------------------------------------------------
+    # Model
+    # ---------------------------------------------------------
+
     model = EigenRCRDFL(
         n_assets=dataset.n_assets,
         lookback=args.lookback,
@@ -224,7 +453,9 @@ def main():
         max_weight=args.max_weight,
         eta=args.eta,
         effective_jitter=args.effective_jitter,
-    ).to(device)
+    ).to(
+        device
+    )
 
     optimizer = torch.optim.AdamW(
         model.return_model.parameters(),
@@ -232,21 +463,207 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    config = vars(args).copy()
+    # ---------------------------------------------------------
+    # Oracle cache
+    # ---------------------------------------------------------
+    #
+    # seed는 cache key에 넣지 않는다.
+    #
+    # Oracle portfolio는 predictor 초기화 seed와 무관하고,
+    # 실제 target return + risk matrix + MVO 설정으로 결정된다.
+    #
+    # 따라서 동일한
+    #
+    #   K
+    #   scale_mode
+    #   eta
+    #   risk_aversion
+    #   max_weight
+    #
+    # 에서는 seed 42/43/44가 같은 cache를 재사용한다.
+    # ---------------------------------------------------------
 
-    config.update({
-        "n_assets": dataset.n_assets,
-        "market_name": dataset.market_name,
-        "device_resolved": str(device),
-        "mean_retained_ratio": retained.mean().item(),
-        "risk_definition": (
-            "Sigma_eff = Sigma + eta * "
-            "sum_{k=1}^K lambda_k u_k u_k^T"
+    oracle_cache_config = {
+        "cache_version": (
+            "eigen_rcr_oracle_v1"
         ),
-    })
+
+        "risk_method": (
+            "eigenmode_residual_risk_v1"
+        ),
+
+        "price_csv": str(
+            Path(args.price_csv)
+        ),
+
+        "date_column": (
+            args.date_column
+        ),
+
+        "lookback": (
+            args.lookback
+        ),
+
+        "return_type": (
+            args.return_type
+        ),
+
+        "covariance_jitter": (
+            args.covariance_jitter
+        ),
+
+        "effective_jitter": (
+            args.effective_jitter
+        ),
+
+        "market_mode": (
+            args.market_mode
+        ),
+
+        "market_price_csv": (
+            str(
+                Path(
+                    args.market_price_csv
+                )
+            )
+            if args.market_price_csv
+            else None
+        ),
+
+        "market_column": (
+            args.market_column
+        ),
+
+        "risk_free_rate": (
+            args.risk_free_rate
+        ),
+
+        "fit_intercept": (
+            not args.no_capm_intercept
+        ),
+
+        "eigen_k": (
+            args.eigen_k
+        ),
+
+        "scale_mode": (
+            args.scale_mode
+        ),
+
+        "eta": (
+            args.eta
+        ),
+
+        "risk_aversion": (
+            args.risk_aversion
+        ),
+
+        "max_weight": (
+            args.max_weight
+        ),
+
+        "n_assets": (
+            dataset.n_assets
+        ),
+
+        "n_samples": (
+            len(dataset)
+        ),
+    }
+
+    (
+        oracle_weights_cache,
+        oracle_cache_path,
+        oracle_cache_hit,
+    ) = load_or_build_oracle_cache(
+        model=model,
+        dataset=dataset,
+        batch_size=args.batch_size,
+        cache_dir=args.oracle_cache_dir,
+        cache_config=oracle_cache_config,
+        force_rebuild=(
+            args.force_rebuild_oracle_cache
+        ),
+    )
+
+    print(
+        "Oracle cache: "
+        f"{'HIT' if oracle_cache_hit else 'BUILD'}"
+    )
+
+    print(
+        "Oracle cache path: "
+        f"{oracle_cache_path}"
+    )
+
+    # ---------------------------------------------------------
+    # Config
+    # ---------------------------------------------------------
+
+    config = (
+        vars(args).copy()
+    )
+
+    config.update(
+        {
+            "n_assets": (
+                dataset.n_assets
+            ),
+
+            "market_name": (
+                dataset.market_name
+            ),
+
+            "device_resolved": (
+                str(device)
+            ),
+
+            "standardize_inputs": (
+                True
+            ),
+
+            "feature_standardizer_file": (
+                "feature_standardizer.pt"
+            ),
+
+            "feature_mean": (
+                feature_mean.tolist()
+            ),
+
+            "feature_std": (
+                feature_std.tolist()
+            ),
+
+            "mean_retained_ratio": (
+                retained.mean().item()
+            ),
+
+            "oracle_cache_path": (
+                str(
+                    oracle_cache_path
+                )
+            ),
+
+            "oracle_cache_hit": (
+                bool(
+                    oracle_cache_hit
+                )
+            ),
+
+            "oracle_cache_config": (
+                oracle_cache_config
+            ),
+
+            "risk_definition": (
+                "Sigma_eff = Sigma + eta * "
+                "sum_{k=1}^K lambda_k u_k u_k^T"
+            ),
+        }
+    )
 
     with open(
-        output_dir / "config.json",
+        output_dir
+        / "config.json",
         "w",
         encoding="utf-8",
     ) as f:
@@ -257,6 +674,10 @@ def main():
             ensure_ascii=False,
         )
 
+    # ---------------------------------------------------------
+    # Training
+    # ---------------------------------------------------------
+
     fit(
         model=model,
         train_loader=train_loader,
@@ -264,16 +685,39 @@ def main():
         test_loader=test_loader,
         optimizer=optimizer,
         device=device,
+
         epochs=args.epochs,
         patience=args.patience,
+
         alpha=args.alpha,
         mse_scale=args.mse_scale,
+
         output_dir=output_dir,
-        gradient_clip_norm=args.gradient_clip_norm,
-        max_train_batches=args.max_train_batches,
-        max_validation_batches=args.max_validation_batches,
-        max_test_batches=args.max_test_batches,
+
+        oracle_weights_cache=(
+            oracle_weights_cache
+        ),
+
+        gradient_clip_norm=(
+            args.gradient_clip_norm
+        ),
+
+        max_train_batches=(
+            args.max_train_batches
+        ),
+
+        max_validation_batches=(
+            args.max_validation_batches
+        ),
+
+        max_test_batches=(
+            args.max_test_batches
+        ),
     )
+
+    # ---------------------------------------------------------
+    # Portfolio backtest
+    # ---------------------------------------------------------
 
     portfolio_metrics = evaluate_portfolio(
         model=model,
@@ -283,35 +727,45 @@ def main():
         output_dir=output_dir,
     )
 
-    print("\nPortfolio Backtest")
+    print(
+        "\nPortfolio Backtest"
+    )
+
     print(
         f"Cumulative Return : "
         f"{portfolio_metrics['cumulative_return']:.6f}"
     )
+
     print(
         f"Annualized Return : "
         f"{portfolio_metrics['annualized_return']:.6f}"
     )
+
     print(
         f"Volatility        : "
         f"{portfolio_metrics['volatility']:.6f}"
     )
+
     print(
         f"Sharpe            : "
         f"{portfolio_metrics['sharpe']:.6f}"
     )
+
     print(
         f"Max Drawdown      : "
         f"{portfolio_metrics['max_drawdown']:.6f}"
     )
+
     print(
         f"Calmar            : "
         f"{portfolio_metrics['calmar']:.6f}"
     )
+
     print(
         f"Annual Turnover   : "
         f"{portfolio_metrics['annualized_turnover']:.6f}"
     )
+
     print(
         f"Active Assets     : "
         f"{portfolio_metrics['active_assets']:.3f}"
