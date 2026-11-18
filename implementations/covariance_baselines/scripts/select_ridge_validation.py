@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 
-RIDGE_VALUES = {0.05, 0.10, 0.20, 0.30, 0.40}
+RIDGE_VALUES = [0.00, 0.01, 0.03, 0.10, 0.30, 1.00]
 SEEDS = {42, 43, 44, 45, 46}
 
 ROOT = Path(

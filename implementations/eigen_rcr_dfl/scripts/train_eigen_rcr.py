@@ -485,7 +485,7 @@ def main():
 
     oracle_cache_config = {
         "cache_version": (
-            "eigen_rcr_oracle_v1"
+            "eigen_rcr_oracle_v2"
         ),
 
         "risk_method": (
@@ -507,6 +507,10 @@ def main():
         "return_type": (
             args.return_type
         ),
+
+        "dtype": str(dataset.dtype),
+        
+        "base_covariance_cache_key": dataset.base_covariance_cache_key,
 
         "covariance_jitter": (
             args.covariance_jitter

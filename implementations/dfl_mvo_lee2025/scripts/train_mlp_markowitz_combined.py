@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from html import parser
 import json
 import platform
 import shlex
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from torch import nn
+from torch import device, nn
 from torch.utils.data import DataLoader
 
 
@@ -104,11 +105,9 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=15.0,
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--init-seed", type=int, default=None)
+    parser.add_argument("--shuffle-seed", type=int, default=None)
     parser.add_argument(
         "--dropout",
         type=float,
@@ -559,8 +558,8 @@ def run_epoch(
     total_samples = 0
 
     for batch_index, batch in enumerate(loader):
-        features = batch["features"].to(device)
-        targets = batch["target"].to(device)
+        features = batch["features"].to(device=device, dtype=torch.float32)
+        targets = batch["target"].to(device=device, dtype=torch.float32)
         covariance = batch["covariance"]
         oracle_weights = batch.get(
             "oracle_weight"
@@ -678,8 +677,8 @@ def evaluate_validation_portfolio_metrics(
 
     with torch.no_grad():
         for batch in loader:
-            features = batch["features"].to(device)
-            targets = batch["target"].to(device)
+            features = batch["features"].to(device=device, dtype=torch.float32)
+            targets = batch["target"].to(device=device, dtype=torch.float32)
             covariance = batch["covariance"].to(
                 device="cpu",
                 dtype=torch.float64,
@@ -795,8 +794,8 @@ def evaluate_and_save_test_results(
 
     with torch.no_grad():
         for batch in loader:
-            features = batch["features"].to(device)
-            targets = batch["target"].to(device)
+            features = batch["features"].to(device=device, dtype=torch.float32)
+            targets = batch["target"].to(device=device, dtype=torch.float32)
             covariance = batch["covariance"].to(
                 device="cpu",
                 dtype=torch.float64,
@@ -1133,7 +1132,7 @@ def main() -> None:
         lookback=args.lookback,
         return_type="simple",
         covariance_jitter=1e-6,
-        dtype=torch.float32,
+        dtype=torch.float64,
 
         risk_cache_dir=(
             args.risk_cache_dir
@@ -1237,7 +1236,7 @@ def main() -> None:
     )
 
     train_generator = torch.Generator()
-    train_generator.manual_seed(args.seed)
+    train_generator.manual_seed(args.shuffle_seed if args.shuffle_seed is not None else args.seed)
 
     train_loader = DataLoader(
         train_set,
@@ -1263,6 +1262,12 @@ def main() -> None:
         num_workers=0,
         pin_memory=device.type == "cuda",
     )
+
+    if args.init_seed is not None:
+        torch.manual_seed(args.init_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.init_seed)
+
 
     model = MLPWithMarkowitz(
         n_assets=dataset.n_assets,

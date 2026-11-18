@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from email import generator, parser
 import json
 import random
 import shutil
@@ -112,6 +113,8 @@ def parse_args():
     )
 
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--init-seed", type=int, default=None)
+    parser.add_argument("--shuffle-seed", type=int, default=None)
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
@@ -325,7 +328,7 @@ def main():
     )
 
     generator = torch.Generator()
-    generator.manual_seed(args.seed)
+    generator.manual_seed(args.shuffle_seed if args.shuffle_seed is not None else args.seed)
 
     train_loader = DataLoader(
         train_dataset,
@@ -351,6 +354,11 @@ def main():
 
     # Rank-Tail Sigma_eff가 dataset의 covariance에 이미 들어 있다.
     # 따라서 기존 EigenRCRDFL에서는 eta=0으로 설정한다.
+    if args.init_seed is not None:
+        torch.manual_seed(args.init_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.init_seed)
+
     model = EigenRCRDFL(
         n_assets=dataset.n_assets,
         lookback=args.lookback,

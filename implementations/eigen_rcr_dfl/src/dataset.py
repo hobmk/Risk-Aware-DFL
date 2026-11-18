@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal
+from implementations.dfl_mvo_lee2025.src.cache import load_or_build_covariance_cache
 
 import numpy as np
 import pandas as pd
@@ -218,14 +219,16 @@ class EigenRCRDataset(Dataset):
             fit_intercept=self.fit_intercept,
         )
 
-        covariance = covariance_matrix(asset_windows)
-
-        eye = torch.eye(
-            self.n_assets,
+        covariance, cache_path, _, cache_key = load_or_build_covariance_cache(
+            returns=self.returns,
+            lookback=self.lookback,
+            covariance_jitter=self.covariance_jitter,
             dtype=self.dtype,
-        ).unsqueeze(0)
+            cache_dir="implementations/dfl_mvo_lee2025/cache/risk_matrix",
+        )
 
-        covariance = covariance + self.covariance_jitter * eye
+        self.base_covariance_cache_key = cache_key
+        self.base_covariance_cache_path = str(cache_path)
 
         eigen = build_eigenmode_risk(
             residuals=capm.residuals,
